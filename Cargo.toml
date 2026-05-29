@@ -1,0 +1,3 @@
+[workspace]
+members = ["crypto/modular-ac", "crypto/agever", "web"]
+resolver = "3"

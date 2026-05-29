@@ -1,0 +1,607 @@
+use ark_std::rand::{SeedableRng, rngs::StdRng};
+use axum::{
+    Router, extract::{Form, Json, State}, http::StatusCode, response::{Html, IntoResponse, Redirect}, routing::{get, post}
+};
+use tower_http::trace::{DefaultMakeSpan, DefaultOnResponse, TraceLayer};
+use tracing::Level;
+use base64::{Engine, prelude::BASE64_STANDARD};
+use openssl::{
+    x509::X509,
+    x509::store::{X509Store, X509StoreBuilder},
+};
+use image::{ExtendedColorType, ImageEncoder, codecs::png::PngEncoder};
+use qrcode::QrCode;
+use agever::{AgeVerParams as Params,
+     AgeVerIssuer as Issuer,
+     AgeVerIssuerKeyPair as IssuerKeyPair,
+     AgeVerIssuerPublicKey as IssuerPublicKey,
+     AgeVerVerifier as Verifier,
+     AgeVerPresentation as Presentation};
+use serde::Deserialize;
+use axum_extra::extract::cookie::{Cookie, CookieJar};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+};
+use uuid::Uuid;
+
+mod cert;
+mod trust_anchors;
+use crate::cert::{verify_cert_chain, extract_holder_pk};
+
+struct AppState {
+    sessions: Mutex<HashMap<String, bool>>,
+    issuer: Issuer,
+    verifier: Verifier,
+    _params: Params,
+    _keypair: IssuerKeyPair,
+    trust_anchor_store: X509Store,
+    /// When false, the StrongBox security-level check is skipped (emulator / test mode).
+    require_attestation: bool,
+}
+
+type SharedState = Arc<AppState>;
+
+#[tokio::main]
+async fn main() {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "tower_http=info,web=info".into()),
+        )
+        .init();
+    let state = build_state();
+    let app = build_app(state);
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
+    tracing::info!("Listening on http://0.0.0.0:3000");
+    axum::serve(listener, app).await.unwrap();
+}
+
+fn build_state() -> SharedState {
+    let params = Params::new();
+    let mut rng = match std::env::var("ISSUER_SECRET") {
+        Ok(secret) => {
+            let seed: [u8; 32] = secret.as_bytes().try_into()
+                .unwrap_or_else(|_| panic!("ISSUER_SECRET must be exactly 32 bytes, had {})", secret.len()));
+            StdRng::from_seed(seed)
+        }
+        Err(std::env::VarError::NotPresent) => StdRng::from_entropy(),
+        Err(e) => panic!("ISSUER_SECRET env var is not valid UTF-8: {e}"),
+    };
+    let keypair = IssuerKeyPair::new(&mut rng);
+    let issuer_pk = IssuerPublicKey::from_keypair(keypair.clone());
+
+    // Load extra trust anchors from a PEM file when EXTRA_TRUST_CERTS_PEM_FILE is set.
+    // Useful for emulator testing where the key attestation chain is rooted in a
+    // different CA than the production Google roots.
+    let extra_der_certs: Vec<Vec<u8>> = match std::env::var("EXTRA_TRUST_CERTS_PEM_FILE") {
+        Ok(path) => {
+            let pem = std::fs::read(&path)
+                .unwrap_or_else(|e| panic!("cannot read EXTRA_TRUST_CERTS_PEM_FILE ({path}): {e}"));
+            X509::stack_from_pem(&pem)
+                .unwrap_or_else(|e| panic!("cannot parse EXTRA_TRUST_CERTS_PEM_FILE ({path}): {e}"))
+                .into_iter()
+                .map(|c| c.to_der().expect("cert to DER"))
+                .collect()
+        }
+        Err(std::env::VarError::NotPresent) => vec![],
+        Err(e) => panic!("EXTRA_TRUST_CERTS_PEM_FILE env var is not valid UTF-8: {e}"),
+    };
+
+    // When REQUIRE_ATTEST=false (or "0"), skip the Android StrongBox level check.
+    // Needed for emulator builds which attest at security level 0 instead of 2.
+    let require_attestation = std::env::var("REQUIRE_ATTEST")
+        .map(|v| v != "false" && v != "0")
+        .unwrap_or(true);
+
+    if !extra_der_certs.is_empty() {
+        tracing::info!(
+            count = extra_der_certs.len(),
+            "loaded extra trust anchors from EXTRA_TRUST_CERTS_PEM_FILE"
+        );
+    }
+    if !require_attestation {
+        tracing::warn!("StrongBox attestation check is DISABLED (REQUIRE_ATTEST=false)");
+    }
+
+    Arc::new(AppState {
+        sessions: Mutex::new(HashMap::new()),
+        _params: params.clone(),
+        _keypair: keypair.clone(),
+        issuer: Issuer::new(&params, keypair.clone()),
+        verifier: Verifier::new(&params, &issuer_pk),
+        trust_anchor_store: build_trust_store(&extra_der_certs),
+        require_attestation,
+    })
+}
+
+/// Builds an X509Store from the built-in Google Key Attestation root CAs plus any
+/// caller-supplied extra DER-encoded certificates (e.g. emulator or test roots).
+/// PARTIAL_CHAIN is enabled so that a single self-signed cert in the store is
+/// accepted as a trust anchor without needing further chain building.
+fn build_trust_store(extra_der_certs: &[Vec<u8>]) -> X509Store {
+    use openssl::x509::verify::X509VerifyFlags;
+    let mut store_builder = X509StoreBuilder::new().unwrap();
+    store_builder.set_flags(X509VerifyFlags::PARTIAL_CHAIN).unwrap();
+    for der in trust_anchors::default_trust_anchor_ders()
+        .iter()
+        .chain(extra_der_certs.iter())
+    {
+        let cert = X509::from_der(der).expect("trust anchor DER is not a valid certificate");
+        store_builder.add_cert(cert).unwrap();
+    }
+    store_builder.build()
+}
+
+fn build_app(state: SharedState) -> Router {
+    Router::new()
+        .route("/", get(index))
+        .route("/ageverification", get(ageverification))
+        .route("/logout", get(logout))
+        .route("/validate", post(validate))
+        .route("/status", get(status))
+        .route("/issue", post(issue))
+        .layer(
+            TraceLayer::new_for_http()
+                .make_span_with(DefaultMakeSpan::new().level(Level::INFO))
+                .on_response(DefaultOnResponse::new().level(Level::INFO)),
+        )
+        .with_state(state)
+}
+
+async fn index(State(state): State<SharedState>, jar: CookieJar) -> impl IntoResponse {
+    let validated = jar
+        .get("session_id")
+        .map(|c| state.sessions.lock().unwrap().get(c.value()).copied() == Some(true))
+        .unwrap_or(false);
+
+    if validated {
+        let id = jar.get("session_id").unwrap().value().to_string();
+        Html(welcome_html(&id)).into_response()
+    } else {
+        Html(login_html()).into_response()
+    }
+}
+
+async fn ageverification(State(state): State<SharedState>, jar: CookieJar) -> impl IntoResponse {
+    if let Some(c) = jar.get("session_id") {
+        let sessions = state.sessions.lock().unwrap();
+        if sessions.get(c.value()).copied() == Some(true) {
+            drop(sessions);
+            return Redirect::to(".").into_response();
+        }
+        if sessions.contains_key(c.value()) {
+            let id = c.value().to_string();
+            drop(sessions);
+            return (jar, Html(pending_html(&id))).into_response();
+        }
+    }
+
+    let id = Uuid::new_v4().to_string();
+    state.sessions.lock().unwrap().insert(id.clone(), false);
+    let jar = jar.add(Cookie::new("session_id", id.clone()));
+    (jar, Html(pending_html(&id))).into_response()
+}
+
+async fn logout(State(state): State<SharedState>, jar: CookieJar) -> impl IntoResponse {
+    if let Some(c) = jar.get("session_id") {
+        state.sessions.lock().unwrap().remove(c.value());
+    }
+    let jar = jar.remove(Cookie::from("session_id"));
+    (jar, Redirect::to("."))
+}
+
+#[derive(Deserialize, Debug)]
+struct IssueRequest {
+    /// Certificate chain, leaf first. Each entry is standard base64-encoded DER.
+    cert_chain: Vec<String>
+}
+
+async fn issue(
+    State(state): State<SharedState>,
+    Json(req): Json<IssueRequest>,
+) -> impl IntoResponse {
+    tracing::info!("issue request received");
+
+    println!("{:?}", req);
+
+    let chain_result = verify_cert_chain(&req.cert_chain, &state.trust_anchor_store);
+    if let Err((_, msg)) = chain_result {
+        if state.require_attestation {
+            return (StatusCode::BAD_REQUEST, msg).into_response();
+        }
+        tracing::info!(error = msg, "attestation check failed but proceeding (require_attestation=false)");
+    }
+
+    let holder_pk = match extract_holder_pk(&req.cert_chain) {
+        Ok(pk) => pk,
+        Err((code, msg)) => return (code, msg).into_response(),
+    };
+
+    let cred = state.issuer.issue_credential("John Doe".to_string(), 20, holder_pk);
+    match cred {
+        Ok(c) => c.to_jwt().into_response(),
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("credential issuance failed: {e:?}")).into_response(),
+    }
+}
+
+async fn validate(
+    State(state): State<SharedState>,
+    Form(form): Form<ValidateForm>,
+) -> impl IntoResponse {
+    tracing::info!(session_id = %form.session_id, token = "[skipped]", "validate form received");
+
+    print!("Validating session: {}", form.session_id);
+
+    if !state.sessions.lock().unwrap().contains_key(&form.session_id) {
+        return (StatusCode::NOT_FOUND, "session not found").into_response();
+    }
+
+    // decodes token from standard base64:
+    let pres = match Presentation::from_base64(&form.token) {
+        Ok(p) => p,
+        Err(_) => return (StatusCode::BAD_REQUEST, "invalid token encoding").into_response(),
+    };
+
+    // checks that the presentation time is not further than 60 sec.
+    if pres.today.abs_diff(chrono::Utc::now().timestamp() as u64) > 60 {
+        return (StatusCode::BAD_REQUEST, "invalid token: presentation time is too far from current time").into_response();
+    }
+
+    let nonce = format!("demo-nonce-{}", form.session_id).as_bytes().to_vec(); // In a real application, this should be a unique value generated for each session and included in the QR code.
+    if !state.verifier.verify(&pres, &nonce) {
+        return (StatusCode::BAD_REQUEST, "invalid token").into_response();
+    }
+
+    state.sessions.lock().unwrap().insert(form.session_id, true);
+
+    "validated".into_response()
+}
+
+#[derive(Deserialize, Debug)]
+struct ValidateForm {
+    session_id: String,
+    token: String,
+}
+
+async fn status(State(state): State<SharedState>, jar: CookieJar) -> Json<serde_json::Value> {
+    let validated = jar
+        .get("session_id")
+        .map(|c| {
+            state.sessions
+                .lock()
+                .unwrap()
+                .get(c.value())
+                .copied()
+                .unwrap_or(false)
+        })
+        .unwrap_or(false);
+    Json(serde_json::json!({ "validated": validated }))
+}
+
+
+fn qr_png_base64(data: &str) -> String {
+    let code = QrCode::new(data.as_bytes()).unwrap();
+    let img = code.render::<image::Luma<u8>>().min_dimensions(200, 200).build();
+    let mut buf = Vec::new();
+    PngEncoder::new(&mut buf)
+        .write_image(img.as_raw(), img.width(), img.height(), ExtendedColorType::L8)
+        .unwrap();
+    BASE64_STANDARD.encode(&buf)
+}
+
+fn pending_html(session_id: &str) -> String {
+    let qr_data = format!(r#"{{"sessid":"{}"}}"#, session_id);
+    let qr_b64 = qr_png_base64(&qr_data);
+    format!(
+        r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Pending Validation</title>
+  <style>
+    body {{ font-family: sans-serif; max-width: 600px; margin: 4rem auto; text-align: center; }}
+    code {{ background: #f0f0f0; padding: 0.2em 0.4em; border-radius: 4px; font-size: 1.1em; }}
+    .hint {{ margin-top: 2rem; color: #888; font-size: 0.9em; }}
+    img {{ margin-top: 1.5rem; image-rendering: pixelated; }}
+    .btn {{ display: inline-block; margin-top: 1.5rem; padding: 0.6em 1.4em; background: #1a73e8; color: #fff; text-decoration: none; border-radius: 6px; font-size: 1em; }}
+    .btn:hover {{ background: #1558b0; }}
+  </style>
+</head>
+<body>
+  <h1>Session Pending Validation</h1>
+  <p>Your session ID is: <code>{session_id}</code></p>
+  <img src="data:image/png;base64,{qr_b64}" alt="QR code" width="200" height="200">
+  <br />
+  <a class="btn" href="demowallet://verify?sessid={session_id}">Open in wallet app</a>
+  <p id="dot">Waiting for validation…</p>
+  <script>
+    setInterval(async () => {{
+      const res = await fetch('status');
+      const data = await res.json();
+      if (data.validated) window.location.href = '.';
+    }}, 1000);
+  </script>
+</body>
+</html>"#
+    )
+}
+
+fn welcome_html(session_id: &str) -> String {
+    format!(
+        r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Welcome</title>
+  <style>
+    body {{ font-family: sans-serif; max-width: 600px; margin: 4rem auto; text-align: center; }}
+    code {{ background: #f0f0f0; padding: 0.2em 0.4em; border-radius: 4px; }}
+    a {{ color: #c00; }}
+  </style>
+</head>
+<body>
+  <h1>Welcome!</h1>
+  <p>Session <code>{session_id}</code> has been validated.</p>
+  <p><a href="logout">Log out</a></p>
+</body>
+</html>"#
+    )
+}
+
+fn login_html() -> String {
+    r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Age Verification</title>
+  <style>
+    body { font-family: sans-serif; max-width: 600px; margin: 4rem auto; text-align: center; }
+    a { color: #00c; font-size: 1.1em; }
+  </style>
+</head>
+<body>
+  <h1>Age Verification Required</h1>
+  <p>You must verify your age to continue.</p>
+  <p><a href="ageverification">Verify my age</a></p>
+</body>
+</html>"#.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agever::{AgeVerPresenter, holder_sk_to_bytes};
+    use axum::body::Body;
+    use agever::{
+        AgeVerCredential as Credential,
+        gen_holder_keypair,
+        gen_holder_sig,
+    };
+    use axum::http::{Request, StatusCode};
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
+    // Extract the session ID value from a Set-Cookie header like "session_id=abc; Path=/"
+    fn extract_session_id(response: &axum::response::Response) -> String {
+        let set_cookie = response.headers()["set-cookie"].to_str().unwrap();
+        set_cookie
+            .split(';').next().unwrap()
+            .split('=').nth(1).unwrap()
+            .to_string()
+    }
+
+    async fn body_string(response: axum::response::Response) -> String {
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    /// Creates a P-256 self-signed X.509 certificate DER from raw key material.
+    /// `pk_uncompressed`: uncompressed SEC1 public key (0x04 || x || y, 65 bytes).
+    /// `sk_scalar_be`: private scalar as big-endian 32 bytes.
+    fn make_self_signed_cert_der(pk_uncompressed: &[u8], sk_scalar_be: &[u8]) -> Vec<u8> {
+        use openssl::{
+            asn1::{Asn1Integer, Asn1Time},
+            bn::{BigNum, BigNumContext},
+            ec::{EcGroup, EcKey, EcPoint},
+            hash::MessageDigest,
+            nid::Nid,
+            pkey::PKey,
+            x509::{X509Builder, X509NameBuilder},
+        };
+        let group = EcGroup::from_curve_name(Nid::X9_62_PRIME256V1).unwrap();
+        let mut bnctx = BigNumContext::new().unwrap();
+        let private_bn = BigNum::from_slice(sk_scalar_be).unwrap();
+        let public_point = EcPoint::from_bytes(&group, pk_uncompressed, &mut bnctx).unwrap();
+        let ec_key = EcKey::from_private_components(&group, &private_bn, &public_point).unwrap();
+        let pkey = PKey::from_ec_key(ec_key).unwrap();
+
+        let mut name_builder = X509NameBuilder::new().unwrap();
+        name_builder.append_entry_by_nid(Nid::COMMONNAME, "test-holder").unwrap();
+        let name = name_builder.build();
+
+        let mut builder = X509Builder::new().unwrap();
+        builder.set_version(2).unwrap();
+        let serial_bn = BigNum::from_u32(1).unwrap();
+        let serial = Asn1Integer::from_bn(&serial_bn).unwrap();
+        builder.set_serial_number(&serial).unwrap();
+        builder.set_subject_name(&name).unwrap();
+        builder.set_issuer_name(&name).unwrap();
+        builder.set_not_before(&Asn1Time::days_from_now(0).unwrap()).unwrap();
+        builder.set_not_after(&Asn1Time::days_from_now(3650).unwrap()).unwrap();
+        builder.set_pubkey(&pkey).unwrap();
+        builder.sign(&pkey, MessageDigest::sha256()).unwrap();
+        builder.build().to_der().unwrap()
+    }
+
+    /// Builds a test AppState with a freshly generated holder keypair whose
+    /// self-signed cert is the sole trust anchor, and attestation checks disabled.
+    /// Returns: (shared state, holder keypair, base64-DER of self-signed cert).
+    fn build_test_state_with_cert() -> (SharedState, agever::AgeVerHolderKeyPair, String) {
+        use openssl::{
+            bn::{BigNum, BigNumContext},
+            ec::{EcGroup, EcPoint, PointConversionForm},
+            nid::Nid,
+        };
+        let params = Params::new();
+        let mut rng = StdRng::from_seed(
+            "dde5262705c68d2dbc4ad35c7b1738a1".as_bytes().try_into().unwrap(),
+        );
+        let issuer_keypair = IssuerKeyPair::new(&mut rng);
+        let issuer_pk = IssuerPublicKey::from_keypair(issuer_keypair.clone());
+
+        let holder_keypair = gen_holder_keypair();
+
+        // Derive the P-256 public key (uncompressed SEC1) from the private scalar via OpenSSL.
+        let sk_bytes = holder_sk_to_bytes(&holder_keypair.secret_key());
+        let group = EcGroup::from_curve_name(Nid::X9_62_PRIME256V1).unwrap();
+        let private_bn = BigNum::from_slice(&sk_bytes).unwrap();
+        let mut bnctx = BigNumContext::new().unwrap();
+        let mut public_point = EcPoint::new(&group).unwrap();
+        public_point.mul_generator(&group, &private_bn, &bnctx).unwrap();
+        let pk_uncompressed = public_point
+            .to_bytes(&group, PointConversionForm::UNCOMPRESSED, &mut bnctx)
+            .unwrap();
+
+        let cert_der = make_self_signed_cert_der(&pk_uncompressed, &sk_bytes);
+        let cert_b64 = BASE64_STANDARD.encode(&cert_der);
+
+        let state = Arc::new(AppState {
+            sessions: Mutex::new(HashMap::new()),
+            _params: params.clone(),
+            _keypair: issuer_keypair.clone(),
+            issuer: Issuer::new(&params, issuer_keypair.clone()),
+            verifier: Verifier::new(&params, &issuer_pk),
+            trust_anchor_store: build_trust_store(&[cert_der]),
+            require_attestation: false,
+        });
+
+        (state, holder_keypair, cert_b64)
+    }
+
+    #[tokio::test]
+    async fn test_get_index_no_session() {
+        let app = build_app(build_state());
+        let response = app
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(!response.headers().contains_key("set-cookie"));
+        let body = body_string(response).await;
+        assert!(body.contains("ageverification"));
+    }
+
+    #[tokio::test]
+    async fn test_ageverification_creates_session() {
+        let app = build_app(build_state());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/ageverification")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response.headers().contains_key("set-cookie"));
+        let body = body_string(response).await;
+        assert!(body.contains("Pending"));
+    }
+
+    #[tokio::test]
+    async fn test_token_issue() {
+        let (state, _holder_keypair, cert_b64) = build_test_state_with_cert();
+        let app = build_app(state);
+
+        let body = serde_json::json!({ "cert_chain": [cert_b64] }).to_string();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/issue")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = body_string(response).await;
+        println!("{:?}", body);
+        assert_eq!(status, StatusCode::OK);
+        let _token = Credential::from_jwt(&body).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_validate_and_welcome() {
+        let (state, holder_keypair, cert_b64) = build_test_state_with_cert();
+
+        // Step 0: get a credential via /issue
+        let issue_body = serde_json::json!({ "cert_chain": [cert_b64] }).to_string();
+        let response = build_app(Arc::clone(&state))
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/issue")
+                    .header("content-type", "application/json")
+                    .body(Body::from(issue_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let cred = Credential::from_jwt(&body_string(response).await).unwrap();
+
+        // Step 1: GET /ageverification to create a session
+        let response = build_app(Arc::clone(&state))
+            .oneshot(
+                Request::builder()
+                    .uri("/ageverification")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let session_id = extract_session_id(&response);
+
+        // Step 2: POST /validate with presentation
+        let presenter =
+            AgeVerPresenter::new(&state._params, cred, &holder_keypair.public_key()).unwrap();
+        let nonce = "demo-nonce".as_bytes().to_vec();
+        let sig = gen_holder_sig(&nonce, &holder_keypair.secret_key());
+        let today = chrono::Utc::now().timestamp() as u64;
+        let pres = presenter.present(today, &nonce, &sig);
+        let pres_b64 = pres.to_base64();
+
+        let body = format!("session_id={session_id}&token={pres_b64}");
+        let response = build_app(Arc::clone(&state))
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/validate")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Step 3: GET / with session cookie — should show Welcome
+        let response = build_app(Arc::clone(&state))
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .header("cookie", format!("session_id={session_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_string(response).await;
+        assert!(body.contains("Welcome"));
+    }
+}
