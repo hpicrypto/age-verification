@@ -221,7 +221,8 @@ pub fn gap_credential_from_jwt(s: &str) -> Result<AgeVerGapCredential, AgeVerErr
     Ok(AgeVerGapCredential(cred))
 }
 
-/// Holder-side scan: finds the gap (if any) whose hidden bounds strictly bracket `uid`. 
+/// Holder-side scan: finds the gap (if any) whose hidden bounds strictly bracket `uid`.
+#[uniffi::export]
 pub fn find_bracket(gaps: Vec<Arc<AgeVerGapCredential>>, uid: u64) -> Option<Arc<AgeVerGapCredential>> {
     gaps.into_iter().find(|gap| {
         let lo = match gap.0.claims.get(GAP_LO_FIELD) { Some(Claim::Raw(v)) => *v, _ => return false };
