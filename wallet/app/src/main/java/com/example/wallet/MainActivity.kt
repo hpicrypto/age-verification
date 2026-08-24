@@ -19,11 +19,13 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Cancel
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Error
 import androidx.compose.material.icons.filled.Key
 import androidx.compose.material.icons.filled.QrCodeScanner
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CardDefaults
@@ -78,6 +80,7 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import uniffi.agever.AgeVerCredential
+import uniffi.agever.AgeVerGapCredential
 import uniffi.agever.AgeVerHolderPublicKey
 import java.math.BigInteger
 import java.security.interfaces.ECPublicKey
@@ -131,6 +134,13 @@ class MainActivity : ComponentActivity() {
             var isFetching by remember { mutableStateOf(false) }
             var errorMessage by remember { mutableStateOf<String?>(null) }
 
+            var gapList by remember { mutableStateOf<List<AgeVerGapCredential>?>(null) }
+            var isUpdatingRevocation by remember { mutableStateOf(false) }
+            var revocationUpdateTime by remember { mutableStateOf<Long?>(null) }
+            var revocationUpdateError by remember { mutableStateOf<String?>(null) }
+            var isCredentialValid by remember { mutableStateOf<Boolean?>(null) }
+            val scope = rememberCoroutineScope()
+
             val context = androidx.compose.ui.platform.LocalContext.current
             val keyManager = remember { HardwareKeyManager(context) }
 
@@ -143,8 +153,37 @@ class MainActivity : ComponentActivity() {
                     .build()
             }
 
-            val url1 = "https://av-demo.hpi.de/issue"
-            val url2 = "https://av-demo.hpi.de/validate"
+            val url1 = "http://127.0.0.1:3000/issue"
+            val url2 = "http://127.0.0.1:3000/validate"
+            val url3 = "http://127.0.0.1:3000/revocation-status"
+
+            fun updateRevocationStatus() {
+                isUpdatingRevocation = true
+                revocationUpdateError = null
+                scope.launch {
+                    try {
+                        val start = System.currentTimeMillis()
+                        val gapResult = withContext(Dispatchers.IO) {
+                            val request = Request.Builder().url(url3).get().build()
+                            client.newCall(request).execute().use { response ->
+                                if (response.isSuccessful) response.body?.string() else
+                                    throw Exception(response.body?.string())
+                            }
+                        }
+                        val gapsJson = JSONObject(gapResult.orEmpty()).getJSONArray("gaps")
+                        val freshGapList = (0 until gapsJson.length()).map { i ->
+                            uniffi.agever.gapCredentialFromJwt(gapsJson.getString(i))
+                        }
+                        gapList = freshGapList
+                        isCredentialValid = credential?.let { uniffi.agever.findBracket(freshGapList, it.revHandle()) != null }
+                        revocationUpdateTime = System.currentTimeMillis() - start
+                    } catch (e: Exception) {
+                        revocationUpdateError = e.message
+                    } finally {
+                        isUpdatingRevocation = false
+                    }
+                }
+            }
 
             LaunchedEffect(Unit) {
                 if (!cameraPermissionState.status.isGranted) {
@@ -234,9 +273,15 @@ class MainActivity : ComponentActivity() {
                                     isHardwareBacked = isHardwareBacked,
                                     isFetching = isFetching,
                                     errorMessage = errorMessage,
-                                    onNavigateToScanner = { 
+                                    gapList = gapList,
+                                    isUpdatingRevocation = isUpdatingRevocation,
+                                    revocationUpdateTime = revocationUpdateTime,
+                                    revocationUpdateError = revocationUpdateError,
+                                    isCredentialValid = isCredentialValid,
+                                    onUpdateRevocation = { updateRevocationStatus() },
+                                    onNavigateToScanner = {
                                         errorMessage = null
-                                        currentScreen = AppScreen.Scanner 
+                                        currentScreen = AppScreen.Scanner
                                     }
                                 )
                             }
@@ -253,6 +298,7 @@ class MainActivity : ComponentActivity() {
                             PresentationScreen(
                                 sessionId = screen.sessionId,
                                 credential = credential,
+                                gapList = gapList,
                                 holderPublicKey = holderPublicKey,
                                 keyManager = keyManager,
                                 client = client,
@@ -284,6 +330,12 @@ fun DemoScreen(
     isHardwareBacked: Boolean,
     isFetching: Boolean,
     errorMessage: String?,
+    gapList: List<AgeVerGapCredential>?,
+    isUpdatingRevocation: Boolean,
+    revocationUpdateTime: Long?,
+    revocationUpdateError: String?,
+    isCredentialValid: Boolean?,
+    onUpdateRevocation: () -> Unit,
     onNavigateToScanner: () -> Unit
 ) {
     Column(
@@ -326,6 +378,21 @@ fun DemoScreen(
                     isOk = credential != null,
                     loading = isFetching
                 )
+                Spacer(modifier = Modifier.height(8.dp))
+                StatusRow(
+                    label = "Status",
+                    isOk = gapList != null && isCredentialValid != false,
+                    loading = isUpdatingRevocation,
+                    subtitle = when {
+                        revocationUpdateError != null -> revocationUpdateError
+                        isCredentialValid == false -> "This credential is no longer valid"
+                        revocationUpdateTime != null -> "Updated in ${revocationUpdateTime}ms"
+                        else -> "Not fetched yet"
+                    },
+                    icon = if (isCredentialValid == false) Icons.Default.Cancel
+                        else if (gapList != null) Icons.Default.CheckCircle
+                        else Icons.Default.Error
+                )
 
                 if (credential != null) {
                     Spacer(modifier = Modifier.height(16.dp))
@@ -343,14 +410,24 @@ fun DemoScreen(
             }
         }
 
-        Spacer(modifier = Modifier.height(32.dp))
+        Spacer(modifier = Modifier.height(16.dp))
+
+        Button(
+            modifier = Modifier.fillMaxWidth(),
+            enabled = !isUpdatingRevocation,
+            onClick = onUpdateRevocation
+        ) {
+            Text(if (gapList == null) "Update Status" else "Refresh Status")
+        }
+
+        Spacer(modifier = Modifier.height(16.dp))
 
         Button(
             modifier = Modifier
                 .fillMaxWidth()
                 .height(56.dp),
             onClick = onNavigateToScanner,
-            enabled = credential != null
+            enabled = credential != null && gapList != null && isCredentialValid != false
         ) {
             Icon(Icons.Default.QrCodeScanner, contentDescription = null)
             Spacer(modifier = Modifier.size(8.dp))
@@ -422,6 +499,7 @@ fun ScannerScreen(
 fun PresentationScreen(
     sessionId: String,
     credential: AgeVerCredential?,
+    gapList: List<AgeVerGapCredential>?,
     holderPublicKey: AgeVerHolderPublicKey?,
     keyManager: HardwareKeyManager,
     client: OkHttpClient,
@@ -433,8 +511,10 @@ fun PresentationScreen(
     var resultMessage by remember { mutableStateOf<String?>(null) }
     var success by remember { mutableStateOf(false) }
     var statusText by remember { mutableStateOf("Generating presentation") }
-    var generationTime by remember { mutableStateOf<Long?>(null) }
+    var signingTime by remember { mutableStateOf<Long?>(null) }
+    var presentationTime by remember { mutableStateOf<Long?>(null) }
     var verificationTime by remember { mutableStateOf<Long?>(null) }
+
     val scope = rememberCoroutineScope()
 
     fun startPresentation() {
@@ -442,21 +522,31 @@ fun PresentationScreen(
         isProcessing = true
         scope.launch {
             try {
-                val startTimeGen = System.currentTimeMillis()
-                val pres = withContext(Dispatchers.IO) {
-                    // Presentation generation
+                val (pres, signMs, presentMs) = withContext(Dispatchers.IO) {
                     val today = (System.currentTimeMillis() / 1000).toULong()
-                    val nonce = "demo-nonce-${sessionId}".toByteArray() 
-                    
+                    val nonce = "demo-nonce-${sessionId}".toByteArray()
+
                     // Hardware-based signing
                     val startTimeSign = System.currentTimeMillis()
                     val sigBytes = keyManager.sign(nonce)
-                    Log.d("MainActivity", "Signature took ${System.currentTimeMillis() - startTimeSign} ms")
+                    val signMs = System.currentTimeMillis() - startTimeSign
                     val sig = uniffi.agever.holderSigFromDerBytes(sigBytes)
 
-                    uniffi.agever.genPresentation(credential!!, holderPublicKey!!, today, nonce, sig)
+                    val cred = credential!!
+                    val revHandle = cred.revHandle()
+                    // Scanning is disabled from the home screen until the revocation status has
+                    // been fetched at least once, so gapList is always set here.
+                    val bracket = uniffi.agever.findBracket(gapList!!, revHandle)
+                        ?: throw Exception("This credential is no longer valid.")
+
+                    val startTimePresent = System.currentTimeMillis()
+                    val presentation = uniffi.agever.genPresentation(cred, holderPublicKey!!, today, nonce, sig, bracket)
+                    val presentMs = System.currentTimeMillis() - startTimePresent
+
+                    Triple(presentation, signMs, presentMs)
                 }
-                generationTime = System.currentTimeMillis() - startTimeGen
+                signingTime = signMs
+                presentationTime = presentMs
 
                 statusText = "Verifying presentation"
 
@@ -482,7 +572,12 @@ fun PresentationScreen(
                     resultMessage = "The credential was verified successfully."
                 } else {
                     success = false
-                    resultMessage = result.exceptionOrNull()?.message
+                    val serverMessage = result.exceptionOrNull()?.message
+                    resultMessage = if (serverMessage == "invalid token") {
+                        "Your revocation status is out of date. Go back and refresh status, then try again."
+                    } else {
+                        serverMessage
+                    }
                 }
             } catch (e: Exception) {
                 success = false
@@ -560,6 +655,7 @@ fun PresentationScreen(
 
                 Button(
                     modifier = Modifier.fillMaxWidth().height(56.dp),
+                    enabled = gapList != null,
                     onClick = { startPresentation() }
                 ) {
                     Text("Confirm & Share")
@@ -595,13 +691,25 @@ fun PresentationScreen(
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
 
-                if (generationTime != null && verificationTime != null) {
+                if (signingTime != null && presentationTime != null && verificationTime != null) {
                     Spacer(modifier = Modifier.height(16.dp))
-                    Text(
-                        text = "Generation: ${generationTime}ms | Verification: ${verificationTime}ms",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = MaterialTheme.colorScheme.outline
-                    )
+                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                        Text(
+                            text = "Signing: ${signingTime}ms",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.outline
+                        )
+                        Text(
+                            text = "Presentation generation: ${presentationTime}ms",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.outline
+                        )
+                        Text(
+                            text = "Verification (network + server): ${verificationTime}ms",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.outline
+                        )
+                    }
                 }
 
                 Spacer(modifier = Modifier.height(48.dp))
@@ -633,7 +741,13 @@ fun ClaimsList(claimsJson: JSONObject) {
 }
 
 @Composable
-fun StatusRow(label: String, isOk: Boolean, loading: Boolean, subtitle: String? = null) {
+fun StatusRow(
+    label: String,
+    isOk: Boolean,
+    loading: Boolean,
+    subtitle: String? = null,
+    icon: ImageVector = if (isOk) Icons.Default.CheckCircle else Icons.Default.Error
+) {
     Row(
         modifier = Modifier.fillMaxWidth(),
         verticalAlignment = Alignment.CenterVertically,
@@ -656,7 +770,7 @@ fun StatusRow(label: String, isOk: Boolean, loading: Boolean, subtitle: String? 
             )
         } else {
             Icon(
-                imageVector = if (isOk) Icons.Default.CheckCircle else Icons.Default.Error,
+                imageVector = icon,
                 contentDescription = null,
                 tint = if (isOk) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.error
             )
@@ -783,6 +897,12 @@ fun DemoScreenPreview() {
             isHardwareBacked = false,
             isFetching = false,
             errorMessage = null,
+            gapList = null,
+            isUpdatingRevocation = false,
+            revocationUpdateTime = null,
+            revocationUpdateError = null,
+            isCredentialValid = null,
+            onUpdateRevocation = {},
             onNavigateToScanner = {}
         )
     }

@@ -1,6 +1,7 @@
 use ark_std::rand::{SeedableRng, rngs::StdRng};
+use rand::RngCore;
 use axum::{
-    Router, extract::{Form, Json, State}, http::StatusCode, response::{Html, IntoResponse, Redirect}, routing::{get, post}
+    Router, extract::{Form, Json, State}, http::{HeaderMap, StatusCode}, response::{Html, IntoResponse, Redirect}, routing::{get, post}
 };
 use tower_http::trace::{DefaultMakeSpan, DefaultOnResponse, TraceLayer};
 use tracing::Level;
@@ -16,11 +17,16 @@ use agever::{AgeVerParams as Params,
      AgeVerIssuerKeyPair as IssuerKeyPair,
      AgeVerIssuerPublicKey as IssuerPublicKey,
      AgeVerVerifier as Verifier,
-     AgeVerPresentation as Presentation};
+     AgeVerPresentation as Presentation,
+     AgeVerStatusManager as StatusManager,
+     AgeVerStatusManagerKeyPair as StatusManagerKeyPair,
+     AgeVerStatusManagerPublicKey as StatusManagerPublicKey,
+     AgeVerRevocationParams as RevocationParams,
+     AgeVerGapCredential as GapCredential};
 use serde::Deserialize;
 use axum_extra::extract::cookie::{Cookie, CookieJar};
 use std::{
-    collections::HashMap,
+    collections::{BTreeSet, HashMap},
     sync::{Arc, Mutex},
 };
 use uuid::Uuid;
@@ -38,7 +44,23 @@ struct AppState {
     trust_anchor_store: X509Store,
     /// When false, the StrongBox security-level check is skipped (emulator / test mode).
     require_attestation: bool,
+    status_manager: StatusManager,
+    revocation: Mutex<RevocationState>,
+    /// When set, required (via the X-Admin-Secret header) to call /admin/revoke. When unset,
+    /// the endpoint is open - matches require_attestation's permissive-unless-configured default.
+    admin_secret: Option<String>,
 }
+
+struct RevocationState {
+    epoch: u64,
+    revoked: BTreeSet<u64>,
+    gap_list: Vec<GapCredential>,
+}
+
+/// Synthetic revoked handles seeded at startup live at/above this value, far above the range of
+/// real issued rev_handles (which start at 1 and increment by 1). Used to filter them out of the
+/// human-readable /revocation-status view so a real revoke's effect isn't buried in the noise.
+const SEED_REVOKED_BASE: u64 = 1_000_000;
 
 type SharedState = Arc<AppState>;
 
@@ -70,6 +92,33 @@ fn build_state() -> SharedState {
     };
     let keypair = IssuerKeyPair::new(&mut rng);
     let issuer_pk = IssuerPublicKey::from_keypair(keypair.clone());
+
+    let revocation_params = RevocationParams::new();
+    let status_manager_keypair = StatusManagerKeyPair::new(&mut rng);
+    let status_manager_pk = StatusManagerPublicKey::from_keypair(status_manager_keypair.clone());
+    let status_manager = StatusManager::new(&revocation_params, status_manager_keypair);
+    let initial_epoch = 1u64;
+
+    // Seed the revocation list with a batch of synthetic handles so the demo starts with a
+    // realistically large gap list instead of an empty one. These live far above the range of
+    // real issued rev_handles (which start at 1 and increment by 1), so they never collide.
+    let seed_count: u64 = std::env::var("SEED_REVOKED_COUNT")
+        .ok()
+        .map(|v| v.parse().unwrap_or_else(|e| panic!("SEED_REVOKED_COUNT must be a u64: {e}")))
+        .unwrap_or(2_000);
+    let seeded_revoked: BTreeSet<u64> = (SEED_REVOKED_BASE..SEED_REVOKED_BASE + seed_count).collect();
+
+    let seed_start = std::time::Instant::now();
+    let initial_gap_list = status_manager
+        .revoke(initial_epoch, seeded_revoked.iter().cloned().collect())
+        .expect("initial gap list generation failed");
+    tracing::info!(
+        count = seed_count,
+        elapsed = ?seed_start.elapsed(),
+        "seeded initial revocation gap list"
+    );
+
+    let admin_secret = std::env::var("ADMIN_SECRET").ok();
 
     // Load extra trust anchors from a PEM file when EXTRA_TRUST_CERTS_PEM_FILE is set.
     // Useful for emulator testing where the key attestation chain is rooted in a
@@ -109,9 +158,12 @@ fn build_state() -> SharedState {
         _params: params.clone(),
         _keypair: keypair.clone(),
         issuer: Issuer::new(&params, keypair.clone()),
-        verifier: Verifier::new(&params, &issuer_pk),
+        verifier: Verifier::new(&params, &issuer_pk, &revocation_params, &status_manager_pk),
         trust_anchor_store: build_trust_store(&extra_der_certs),
         require_attestation,
+        status_manager,
+        revocation: Mutex::new(RevocationState { epoch: initial_epoch, revoked: seeded_revoked, gap_list: initial_gap_list }),
+        admin_secret,
     })
 }
 
@@ -141,10 +193,16 @@ fn build_app(state: SharedState) -> Router {
         .route("/validate", post(validate))
         .route("/status", get(status))
         .route("/issue", post(issue))
+        .route("/revocation-status", get(revocation_status))
+        .route("/admin/revoke", post(admin_revoke))
         .layer(
+            // DEBUG, not INFO: per-request tracing (including routine polling like the QR
+            // page's 1s /status loop) would otherwise flood the default log. The app's own
+            // tracing::info! calls (issue/revoke/validate) still show at the default level;
+            // opt into full request tracing with RUST_LOG=tower_http=debug when needed.
             TraceLayer::new_for_http()
-                .make_span_with(DefaultMakeSpan::new().level(Level::INFO))
-                .on_response(DefaultOnResponse::new().level(Level::INFO)),
+                .make_span_with(DefaultMakeSpan::new().level(Level::DEBUG))
+                .on_response(DefaultOnResponse::new().level(Level::DEBUG)),
         )
         .with_state(state)
 }
@@ -203,8 +261,6 @@ async fn issue(
 ) -> impl IntoResponse {
     tracing::info!("issue request received");
 
-    println!("{:?}", req);
-
     let chain_result = verify_cert_chain(&req.cert_chain, &state.trust_anchor_store);
     if let Err((_, msg)) = chain_result {
         if state.require_attestation {
@@ -218,7 +274,12 @@ async fn issue(
         Err((code, msg)) => return (code, msg).into_response(),
     };
 
-    let cred = state.issuer.issue_credential("John Doe".to_string(), 20, holder_pk);
+    // Sampled uniformly from the full u64 space rather than assigned sequentially, so the
+    // handle can't be used to infer issuance order or volume.
+    let rev_handle = rand::thread_rng().next_u64();
+    tracing::info!(rev_handle, "issuing credential");
+
+    let cred = state.issuer.issue_credential("John Doe".to_string(), 20, holder_pk, rev_handle);
     match cred {
         Ok(c) => c.to_jwt().into_response(),
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("credential issuance failed: {e:?}")).into_response(),
@@ -230,8 +291,6 @@ async fn validate(
     Form(form): Form<ValidateForm>,
 ) -> impl IntoResponse {
     tracing::info!(session_id = %form.session_id, token = "[skipped]", "validate form received");
-
-    print!("Validating session: {}", form.session_id);
 
     if !state.sessions.lock().unwrap().contains_key(&form.session_id) {
         return (StatusCode::NOT_FOUND, "session not found").into_response();
@@ -249,7 +308,8 @@ async fn validate(
     }
 
     let nonce = format!("demo-nonce-{}", form.session_id).as_bytes().to_vec(); // In a real application, this should be a unique value generated for each session and included in the QR code.
-    if !state.verifier.verify(&pres, &nonce) {
+    let epoch = { state.revocation.lock().unwrap().epoch };
+    if !state.verifier.verify(&pres, &nonce, epoch) {
         return (StatusCode::BAD_REQUEST, "invalid token").into_response();
     }
 
@@ -262,6 +322,55 @@ async fn validate(
 struct ValidateForm {
     session_id: String,
     token: String,
+}
+
+async fn revocation_status(State(state): State<SharedState>) -> Json<serde_json::Value> {
+    let rev = state.revocation.lock().unwrap();
+    let real_revoked: Vec<u64> = rev.revoked.iter().copied().filter(|h| *h < SEED_REVOKED_BASE).collect();
+    let seeded_count = rev.revoked.len() - real_revoked.len();
+    Json(serde_json::json!({
+        "epoch": rev.epoch,
+        "revoked_handles": real_revoked,
+        "seeded_synthetic_revoked_count": seeded_count,
+        "gaps": rev.gap_list.iter().map(|g| g.to_jwt()).collect::<Vec<_>>(),
+    }))
+}
+
+#[derive(Deserialize, Debug)]
+struct RevokeRequest {
+    rev_handle: u64,
+}
+
+/// Constant-time byte comparison, used to check the X-Admin-Secret header without leaking
+/// timing information about how much of the secret matched.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+async fn admin_revoke(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    Json(req): Json<RevokeRequest>,
+) -> impl IntoResponse {
+    if let Some(expected) = &state.admin_secret {
+        let provided = headers.get("x-admin-secret").and_then(|v| v.to_str().ok());
+        let ok = provided.map(|p| constant_time_eq(p.as_bytes(), expected.as_bytes())).unwrap_or(false);
+        if !ok {
+            return (StatusCode::UNAUTHORIZED, "invalid or missing X-Admin-Secret").into_response();
+        }
+    }
+
+    let mut rev = state.revocation.lock().unwrap();
+    rev.revoked.insert(req.rev_handle);
+    rev.epoch += 1;
+    tracing::info!(rev_handle = req.rev_handle, epoch = rev.epoch, "revoking handle");
+    let new_gap_list = match state.status_manager.revoke(rev.epoch, rev.revoked.iter().cloned().collect()) {
+        Ok(list) => list,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("re-signing gap list failed: {e:?}")).into_response(),
+    };
+    rev.gap_list = new_gap_list;
+
+    Json(serde_json::json!({ "epoch": rev.epoch })).into_response()
 }
 
 async fn status(State(state): State<SharedState>, jar: CookieJar) -> Json<serde_json::Value> {
@@ -377,6 +486,8 @@ mod tests {
         AgeVerCredential as Credential,
         gen_holder_keypair,
         gen_holder_sig,
+        gap_credential_from_jwt,
+        find_bracket,
     };
     use axum::http::{Request, StatusCode};
     use http_body_util::BodyExt;
@@ -437,7 +548,7 @@ mod tests {
     /// Builds a test AppState with a freshly generated holder keypair whose
     /// self-signed cert is the sole trust anchor, and attestation checks disabled.
     /// Returns: (shared state, holder keypair, base64-DER of self-signed cert).
-    fn build_test_state_with_cert() -> (SharedState, agever::AgeVerHolderKeyPair, String) {
+    fn build_test_state_with_cert(admin_secret: Option<&str>) -> (SharedState, agever::AgeVerHolderKeyPair, String) {
         use openssl::{
             bn::{BigNum, BigNumContext},
             ec::{EcGroup, EcPoint, PointConversionForm},
@@ -449,6 +560,13 @@ mod tests {
         );
         let issuer_keypair = IssuerKeyPair::new(&mut rng);
         let issuer_pk = IssuerPublicKey::from_keypair(issuer_keypair.clone());
+
+        let revocation_params = RevocationParams::new();
+        let status_manager_keypair = StatusManagerKeyPair::new(&mut rng);
+        let status_manager_pk = StatusManagerPublicKey::from_keypair(status_manager_keypair.clone());
+        let status_manager = StatusManager::new(&revocation_params, status_manager_keypair);
+        let initial_epoch = 1u64;
+        let initial_gap_list = status_manager.revoke(initial_epoch, vec![]).expect("initial gap list generation failed");
 
         let holder_keypair = gen_holder_keypair();
 
@@ -471,9 +589,12 @@ mod tests {
             _params: params.clone(),
             _keypair: issuer_keypair.clone(),
             issuer: Issuer::new(&params, issuer_keypair.clone()),
-            verifier: Verifier::new(&params, &issuer_pk),
+            verifier: Verifier::new(&params, &issuer_pk, &revocation_params, &status_manager_pk),
             trust_anchor_store: build_trust_store(&[cert_der]),
             require_attestation: false,
+            status_manager,
+            revocation: Mutex::new(RevocationState { epoch: initial_epoch, revoked: BTreeSet::new(), gap_list: initial_gap_list }),
+            admin_secret: admin_secret.map(String::from),
         });
 
         (state, holder_keypair, cert_b64)
@@ -512,7 +633,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_token_issue() {
-        let (state, _holder_keypair, cert_b64) = build_test_state_with_cert();
+        let (state, _holder_keypair, cert_b64) = build_test_state_with_cert(None);
         let app = build_app(state);
 
         let body = serde_json::json!({ "cert_chain": [cert_b64] }).to_string();
@@ -536,7 +657,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_validate_and_welcome() {
-        let (state, holder_keypair, cert_b64) = build_test_state_with_cert();
+        let (state, holder_keypair, cert_b64) = build_test_state_with_cert(None);
 
         // Step 0: get a credential via /issue
         let issue_body = serde_json::json!({ "cert_chain": [cert_b64] }).to_string();
@@ -566,13 +687,31 @@ mod tests {
             .unwrap();
         let session_id = extract_session_id(&response);
 
-        // Step 2: POST /validate with presentation
+        // Step 2: fetch the current gap list and find the one that brackets our own handle
+        let revocation_status_response = build_app(Arc::clone(&state))
+            .oneshot(Request::builder().uri("/revocation-status").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(revocation_status_response.status(), StatusCode::OK);
+        let revocation_status_json: serde_json::Value =
+            serde_json::from_str(&body_string(revocation_status_response).await).unwrap();
+        let gaps: Vec<Arc<GapCredential>> = revocation_status_json["gaps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|jwt| Arc::new(gap_credential_from_jwt(jwt.as_str().unwrap()).unwrap()))
+            .collect();
+        let rev_handle = cred.rev_handle().unwrap();
+        let bracket = find_bracket(gaps, rev_handle).expect("should find a bracketing gap");
+
+        // Step 3: POST /validate with presentation
+        let revocation_params = RevocationParams::new();
         let presenter =
-            AgeVerPresenter::new(&state._params, cred, &holder_keypair.public_key()).unwrap();
+            AgeVerPresenter::new(&state._params, cred, &holder_keypair.public_key(), &revocation_params, &bracket).unwrap();
         let nonce = "demo-nonce".as_bytes().to_vec();
         let sig = gen_holder_sig(&nonce, &holder_keypair.secret_key());
         let today = chrono::Utc::now().timestamp() as u64;
-        let pres = presenter.present(today, &nonce, &sig);
+        let pres = presenter.present(today, &nonce, &sig).unwrap();
         let pres_b64 = pres.to_base64();
 
         let body = format!("session_id={session_id}&token={pres_b64}");
@@ -589,7 +728,7 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
 
-        // Step 3: GET / with session cookie — should show Welcome
+        // Step 4: GET / with session cookie — should show Welcome
         let response = build_app(Arc::clone(&state))
             .oneshot(
                 Request::builder()
@@ -603,5 +742,72 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = body_string(response).await;
         assert!(body.contains("Welcome"));
+
+        // Step 5: revoke some other handle (bumping the epoch) and confirm the same,
+        // now-stale presentation is rejected on a fresh /validate call.
+        let revoke_response = build_app(Arc::clone(&state))
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/revoke")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::json!({ "rev_handle": rev_handle + 1000 }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(revoke_response.status(), StatusCode::OK);
+
+        let stale_body = format!("session_id={session_id}&token={pres_b64}");
+        let stale_response = build_app(Arc::clone(&state))
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/validate")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from(stale_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stale_response.status(), StatusCode::BAD_REQUEST, "stale presentation should be rejected after epoch bump");
+    }
+
+    #[tokio::test]
+    async fn test_admin_revoke_guard() {
+        let (state, _holder_keypair, _cert_b64) = build_test_state_with_cert(Some("test-secret"));
+
+        let revoke_body = serde_json::json!({ "rev_handle": 42u64 }).to_string();
+
+        // No header: rejected.
+        let response = build_app(Arc::clone(&state))
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/revoke")
+                    .header("content-type", "application/json")
+                    .body(Body::from(revoke_body.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        // Correct header: accepted, epoch bumped.
+        let response = build_app(Arc::clone(&state))
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/revoke")
+                    .header("content-type", "application/json")
+                    .header("x-admin-secret", "test-secret")
+                    .body(Body::from(revoke_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_str(&body_string(response).await).unwrap();
+        assert_eq!(body["epoch"], 2);
     }
 }

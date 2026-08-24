@@ -637,37 +637,47 @@ internal object IntegrityCheckingUniffiLib {
         uniffiCheckApiChecksums(this)
     }
     external fun uniffi_agever_checksum_func_credential_from_jwt(
-    ): Short
+    ): Int
+    external fun uniffi_agever_checksum_func_find_bracket(
+    ): Int
+    external fun uniffi_agever_checksum_func_gap_credential_from_jwt(
+    ): Int
     external fun uniffi_agever_checksum_func_gen_holder_keypair(
-    ): Short
+    ): Int
     external fun uniffi_agever_checksum_func_gen_holder_sig(
-    ): Short
+    ): Int
     external fun uniffi_agever_checksum_func_gen_presentation(
-    ): Short
+    ): Int
     external fun uniffi_agever_checksum_func_holder_pk_from_bytes(
-    ): Short
+    ): Int
     external fun uniffi_agever_checksum_func_holder_pk_from_uncompressed_sec1(
-    ): Short
+    ): Int
     external fun uniffi_agever_checksum_func_holder_pk_to_base64(
-    ): Short
+    ): Int
     external fun uniffi_agever_checksum_func_holder_sig_from_der_bytes(
-    ): Short
+    ): Int
     external fun uniffi_agever_checksum_func_verify_holder_sig(
-    ): Short
+    ): Int
     external fun uniffi_agever_checksum_method_agevercredential_claims_json_str(
-    ): Short
+    ): Int
+    external fun uniffi_agever_checksum_method_agevercredential_rev_handle(
+    ): Int
     external fun uniffi_agever_checksum_method_agevercredential_to_jwt(
-    ): Short
+    ): Int
+    external fun uniffi_agever_checksum_method_agevergapcredential_claims_json_str(
+    ): Int
+    external fun uniffi_agever_checksum_method_agevergapcredential_to_jwt(
+    ): Int
     external fun uniffi_agever_checksum_method_ageverholderkeypair_public_key(
-    ): Short
+    ): Int
     external fun uniffi_agever_checksum_method_ageverholderkeypair_secret_key(
-    ): Short
+    ): Int
     external fun uniffi_agever_checksum_method_ageverholderpublickey_to_point_string(
-    ): Short
+    ): Int
     external fun uniffi_agever_checksum_method_ageverpresentation_to_base64(
-    ): Short
+    ): Int
     external fun uniffi_agever_checksum_method_ageversignature_as_string(
-    ): Short
+    ): Int
     external fun ffi_agever_uniffi_contract_version(
     ): Int
 
@@ -692,7 +702,17 @@ internal object UniffiLib {
     ): Unit
     external fun uniffi_agever_fn_method_agevercredential_claims_json_str(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
+    external fun uniffi_agever_fn_method_agevercredential_rev_handle(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    ): Long
     external fun uniffi_agever_fn_method_agevercredential_to_jwt(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    external fun uniffi_agever_fn_clone_agevergapcredential(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    ): Long
+    external fun uniffi_agever_fn_free_agevergapcredential(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
+    external fun uniffi_agever_fn_method_agevergapcredential_claims_json_str(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    external fun uniffi_agever_fn_method_agevergapcredential_to_jwt(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     external fun uniffi_agever_fn_clone_ageverholderkeypair(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): Long
@@ -726,11 +746,15 @@ internal object UniffiLib {
     ): RustBuffer.ByValue
     external fun uniffi_agever_fn_func_credential_from_jwt(`s`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Long
+    external fun uniffi_agever_fn_func_find_bracket(`gaps`: RustBuffer.ByValue,`uid`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    external fun uniffi_agever_fn_func_gap_credential_from_jwt(`s`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): Long
     external fun uniffi_agever_fn_func_gen_holder_keypair(uniffi_out_err: UniffiRustCallStatus, 
     ): Long
     external fun uniffi_agever_fn_func_gen_holder_sig(`nonce`: RustBuffer.ByValue,`holderSk`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): Long
-    external fun uniffi_agever_fn_func_gen_presentation(`cred`: Long,`holderPk`: Long,`today`: Long,`nonce`: RustBuffer.ByValue,`holderSig`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    external fun uniffi_agever_fn_func_gen_presentation(`cred`: Long,`holderPk`: Long,`today`: Long,`nonce`: RustBuffer.ByValue,`holderSig`: Long,`gapCred`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): Long
     external fun uniffi_agever_fn_func_holder_pk_from_bytes(`bytes`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Long
@@ -757,7 +781,7 @@ internal object UniffiLib {
     external fun ffi_agever_rust_future_free_u8(`handle`: Long,
     ): Unit
     external fun ffi_agever_rust_future_complete_u8(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
-    ): Byte
+    ): Int
     external fun ffi_agever_rust_future_poll_i8(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
     ): Unit
     external fun ffi_agever_rust_future_cancel_i8(`handle`: Long,
@@ -773,7 +797,7 @@ internal object UniffiLib {
     external fun ffi_agever_rust_future_free_u16(`handle`: Long,
     ): Unit
     external fun ffi_agever_rust_future_complete_u16(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
-    ): Short
+    ): Int
     external fun ffi_agever_rust_future_poll_i16(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
     ): Unit
     external fun ffi_agever_rust_future_cancel_i16(`handle`: Long,
@@ -861,52 +885,67 @@ private fun uniffiCheckContractApiVersion(lib: IntegrityCheckingUniffiLib) {
 }
 @Suppress("UNUSED_PARAMETER")
 private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
-    if (lib.uniffi_agever_checksum_func_credential_from_jwt() != 32911.toShort()) {
+    if (lib.uniffi_agever_checksum_func_credential_from_jwt() != 32911) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_agever_checksum_func_gen_holder_keypair() != 26028.toShort()) {
+    if (lib.uniffi_agever_checksum_func_find_bracket() != 43208) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_agever_checksum_func_gen_holder_sig() != 51868.toShort()) {
+    if (lib.uniffi_agever_checksum_func_gap_credential_from_jwt() != 61578) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_agever_checksum_func_gen_presentation() != 59524.toShort()) {
+    if (lib.uniffi_agever_checksum_func_gen_holder_keypair() != 26028) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_agever_checksum_func_holder_pk_from_bytes() != 52878.toShort()) {
+    if (lib.uniffi_agever_checksum_func_gen_holder_sig() != 51868) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_agever_checksum_func_holder_pk_from_uncompressed_sec1() != 43514.toShort()) {
+    if (lib.uniffi_agever_checksum_func_gen_presentation() != 19600) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_agever_checksum_func_holder_pk_to_base64() != 61039.toShort()) {
+    if (lib.uniffi_agever_checksum_func_holder_pk_from_bytes() != 52878) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_agever_checksum_func_holder_sig_from_der_bytes() != 1663.toShort()) {
+    if (lib.uniffi_agever_checksum_func_holder_pk_from_uncompressed_sec1() != 43514) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_agever_checksum_func_verify_holder_sig() != 30828.toShort()) {
+    if (lib.uniffi_agever_checksum_func_holder_pk_to_base64() != 61039) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_agever_checksum_method_agevercredential_claims_json_str() != 59811.toShort()) {
+    if (lib.uniffi_agever_checksum_func_holder_sig_from_der_bytes() != 1663) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_agever_checksum_method_agevercredential_to_jwt() != 22129.toShort()) {
+    if (lib.uniffi_agever_checksum_func_verify_holder_sig() != 30828) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_agever_checksum_method_ageverholderkeypair_public_key() != 65284.toShort()) {
+    if (lib.uniffi_agever_checksum_method_agevercredential_claims_json_str() != 59811) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_agever_checksum_method_ageverholderkeypair_secret_key() != 4924.toShort()) {
+    if (lib.uniffi_agever_checksum_method_agevercredential_rev_handle() != 61477) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_agever_checksum_method_ageverholderpublickey_to_point_string() != 54436.toShort()) {
+    if (lib.uniffi_agever_checksum_method_agevercredential_to_jwt() != 22129) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_agever_checksum_method_ageverpresentation_to_base64() != 10793.toShort()) {
+    if (lib.uniffi_agever_checksum_method_agevergapcredential_claims_json_str() != 5006) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_agever_checksum_method_ageversignature_as_string() != 23556.toShort()) {
+    if (lib.uniffi_agever_checksum_method_agevergapcredential_to_jwt() != 57254) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_agever_checksum_method_ageverholderkeypair_public_key() != 65284) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_agever_checksum_method_ageverholderkeypair_secret_key() != 4924) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_agever_checksum_method_ageverholderpublickey_to_point_string() != 54436) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_agever_checksum_method_ageverpresentation_to_base64() != 10793) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_agever_checksum_method_ageversignature_as_string() != 23556) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
 }
@@ -1288,6 +1327,12 @@ public interface AgeVerCredentialInterface {
     
     fun `claimsJsonStr`(): kotlin.String
     
+    /**
+     * Reads back this credential's own hidden revocation handle (UID), so the holder can look
+     * up which gap brackets it (see `find_bracket`).
+     */
+    fun `revHandle`(): kotlin.ULong
+    
     fun `toJwt`(): kotlin.String
     
     companion object
@@ -1402,6 +1447,24 @@ open class AgeVerCredential: Disposable, AutoCloseable, AgeVerCredentialInterfac
     }
     
 
+    
+    /**
+     * Reads back this credential's own hidden revocation handle (UID), so the holder can look
+     * up which gap brackets it (see `find_bracket`).
+     */
+    @Throws(AgeVerException::class)override fun `revHandle`(): kotlin.ULong {
+            return FfiConverterULong.lift(
+    callWithHandle {
+    uniffiRustCallWithError(AgeVerException) { _status ->
+    UniffiLib.uniffi_agever_fn_method_agevercredential_rev_handle(
+        it,
+        _status)
+}
+    }
+    )
+    }
+    
+
     override fun `toJwt`(): kotlin.String {
             return FfiConverterString.lift(
     callWithHandle {
@@ -1449,6 +1512,271 @@ public object FfiConverterTypeAgeVerCredential: FfiConverter<AgeVerCredential, L
     override fun allocationSize(value: AgeVerCredential) = 8UL
 
     override fun write(value: AgeVerCredential, buf: ByteBuffer) {
+        buf.putLong(lower(value))
+    }
+}
+
+
+// This template implements a class for working with a Rust struct via a handle
+// to the live Rust struct on the other side of the FFI.
+//
+// There's some subtlety here, because we have to be careful not to operate on a Rust
+// struct after it has been dropped, and because we must expose a public API for freeing
+// theq Kotlin wrapper object in lieu of reliable finalizers. The core requirements are:
+//
+//   * Each instance holds an opaque handle to the underlying Rust struct.
+//     Method calls need to read this handle from the object's state and pass it in to
+//     the Rust FFI.
+//
+//   * When an instance is no longer needed, its handle should be passed to a
+//     special destructor function provided by the Rust FFI, which will drop the
+//     underlying Rust struct.
+//
+//   * Given an instance, calling code is expected to call the special
+//     `destroy` method in order to free it after use, either by calling it explicitly
+//     or by using a higher-level helper like the `use` method. Failing to do so risks
+//     leaking the underlying Rust struct.
+//
+//   * We can't assume that calling code will do the right thing, and must be prepared
+//     to handle Kotlin method calls executing concurrently with or even after a call to
+//     `destroy`, and to handle multiple (possibly concurrent!) calls to `destroy`.
+//
+//   * We must never allow Rust code to operate on the underlying Rust struct after
+//     the destructor has been called, and must never call the destructor more than once.
+//     Doing so may trigger memory unsafety.
+//
+//   * To mitigate many of the risks of leaking memory and use-after-free unsafety, a `Cleaner`
+//     is implemented to call the destructor when the Kotlin object becomes unreachable.
+//     This is done in a background thread. This is not a panacea, and client code should be aware that
+//      1. the thread may starve if some there are objects that have poorly performing
+//     `drop` methods or do significant work in their `drop` methods.
+//      2. the thread is shared across the whole library. This can be tuned by using `android_cleaner = true`,
+//         or `android = true` in the [`kotlin` section of the `uniffi.toml` file](https://mozilla.github.io/uniffi-rs/kotlin/configuration.html).
+//
+// If we try to implement this with mutual exclusion on access to the handle, there is the
+// possibility of a race between a method call and a concurrent call to `destroy`:
+//
+//    * Thread A starts a method call, reads the value of the handle, but is interrupted
+//      before it can pass the handle over the FFI to Rust.
+//    * Thread B calls `destroy` and frees the underlying Rust struct.
+//    * Thread A resumes, passing the already-read handle value to Rust and triggering
+//      a use-after-free.
+//
+// One possible solution would be to use a `ReadWriteLock`, with each method call taking
+// a read lock (and thus allowed to run concurrently) and the special `destroy` method
+// taking a write lock (and thus blocking on live method calls). However, we aim not to
+// generate methods with any hidden blocking semantics, and a `destroy` method that might
+// block if called incorrectly seems to meet that bar.
+//
+// So, we achieve our goals by giving each instance an associated `AtomicLong` counter to track
+// the number of in-flight method calls, and an `AtomicBoolean` flag to indicate whether `destroy`
+// has been called. These are updated according to the following rules:
+//
+//    * The initial value of the counter is 1, indicating a live object with no in-flight calls.
+//      The initial value for the flag is false.
+//
+//    * At the start of each method call, we atomically check the counter.
+//      If it is 0 then the underlying Rust struct has already been destroyed and the call is aborted.
+//      If it is nonzero them we atomically increment it by 1 and proceed with the method call.
+//
+//    * At the end of each method call, we atomically decrement and check the counter.
+//      If it has reached zero then we destroy the underlying Rust struct.
+//
+//    * When `destroy` is called, we atomically flip the flag from false to true.
+//      If the flag was already true we silently fail.
+//      Otherwise we atomically decrement and check the counter.
+//      If it has reached zero then we destroy the underlying Rust struct.
+//
+// Astute readers may observe that this all sounds very similar to the way that Rust's `Arc<T>` works,
+// and indeed it is, with the addition of a flag to guard against multiple calls to `destroy`.
+//
+// The overall effect is that the underlying Rust struct is destroyed only when `destroy` has been
+// called *and* all in-flight method calls have completed, avoiding violating any of the expectations
+// of the underlying Rust code.
+//
+// This makes a cleaner a better alternative to _not_ calling `destroy()` as
+// and when the object is finished with, but the abstraction is not perfect: if the Rust object's `drop`
+// method is slow, and/or there are many objects to cleanup, and it's on a low end Android device, then the cleaner
+// thread may be starved, and the app will leak memory.
+//
+// In this case, `destroy`ing manually may be a better solution.
+//
+// The cleaner can live side by side with the manual calling of `destroy`. In the order of responsiveness, uniffi objects
+// with Rust peers are reclaimed:
+//
+// 1. By calling the `destroy` method of the object, which calls `rustObject.free()`. If that doesn't happen:
+// 2. When the object becomes unreachable, AND the Cleaner thread gets to call `rustObject.free()`. If the thread is starved then:
+// 3. The memory is reclaimed when the process terminates.
+//
+// [1] https://stackoverflow.com/questions/24376768/can-java-finalize-an-object-when-it-is-still-in-scope/24380219
+//
+
+
+public interface AgeVerGapCredentialInterface {
+    
+    fun `claimsJsonStr`(): kotlin.String
+    
+    fun `toJwt`(): kotlin.String
+    
+    companion object
+}
+
+open class AgeVerGapCredential: Disposable, AutoCloseable, AgeVerGapCredentialInterface
+{
+
+    @Suppress("UNUSED_PARAMETER")
+    /**
+     * @suppress
+     */
+    constructor(withHandle: UniffiWithHandle, handle: Long) {
+        this.handle = handle
+        this.cleanable = UniffiLib.CLEANER.register(this, UniffiCleanAction(handle))
+    }
+
+    /**
+     * @suppress
+     *
+     * This constructor can be used to instantiate a fake object. Only used for tests. Any
+     * attempt to actually use an object constructed this way will fail as there is no
+     * connected Rust object.
+     */
+    @Suppress("UNUSED_PARAMETER")
+    constructor(noHandle: NoHandle) {
+        this.handle = 0
+        this.cleanable = null
+    }
+
+    protected val handle: Long
+    protected val cleanable: UniffiCleaner.Cleanable?
+
+    private val wasDestroyed = AtomicBoolean(false)
+    private val callCounter = AtomicLong(1)
+
+    override fun destroy() {
+        // Only allow a single call to this method.
+        // TODO: maybe we should log a warning if called more than once?
+        if (this.wasDestroyed.compareAndSet(false, true)) {
+            // This decrement always matches the initial count of 1 given at creation time.
+            if (this.callCounter.decrementAndGet() == 0L) {
+                cleanable?.clean()
+            }
+        }
+    }
+
+    @Synchronized
+    override fun close() {
+        this.destroy()
+    }
+
+    internal inline fun <R> callWithHandle(block: (handle: Long) -> R): R {
+        // Check and increment the call counter, to keep the object alive.
+        // This needs a compare-and-set retry loop in case of concurrent updates.
+        do {
+            val c = this.callCounter.get()
+            if (c == 0L) {
+                throw IllegalStateException("${this.javaClass.simpleName} object has already been destroyed")
+            }
+            if (c == Long.MAX_VALUE) {
+                throw IllegalStateException("${this.javaClass.simpleName} call counter would overflow")
+            }
+        } while (! this.callCounter.compareAndSet(c, c + 1L))
+        // Now we can safely do the method call without the handle being freed concurrently.
+        try {
+            return block(this.uniffiCloneHandle())
+        } finally {
+            // This decrement always matches the increment we performed above.
+            if (this.callCounter.decrementAndGet() == 0L) {
+                cleanable?.clean()
+            }
+        }
+    }
+
+    // Use a static inner class instead of a closure so as not to accidentally
+    // capture `this` as part of the cleanable's action.
+    private class UniffiCleanAction(private val handle: Long) : Runnable {
+        override fun run() {
+            if (handle == 0.toLong()) {
+                // Fake object created with `NoHandle`, don't try to free.
+                return;
+            }
+            uniffiRustCall { status ->
+                UniffiLib.uniffi_agever_fn_free_agevergapcredential(handle, status)
+            }
+        }
+    }
+
+    /**
+     * @suppress
+     */
+    fun uniffiCloneHandle(): Long {
+        if (handle == 0.toLong()) {
+            throw InternalException("uniffiCloneHandle() called on NoHandle object");
+        }
+        return uniffiRustCall() { status ->
+            UniffiLib.uniffi_agever_fn_clone_agevergapcredential(handle, status)
+        }
+    }
+
+    override fun `claimsJsonStr`(): kotlin.String {
+            return FfiConverterString.lift(
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_agever_fn_method_agevergapcredential_claims_json_str(
+        it,
+        _status)
+}
+    }
+    )
+    }
+    
+
+    override fun `toJwt`(): kotlin.String {
+            return FfiConverterString.lift(
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_agever_fn_method_agevergapcredential_to_jwt(
+        it,
+        _status)
+}
+    }
+    )
+    }
+    
+
+    
+
+    
+
+
+    
+    
+    /**
+     * @suppress
+     */
+    companion object
+    
+}
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeAgeVerGapCredential: FfiConverter<AgeVerGapCredential, Long> {
+    override fun lower(value: AgeVerGapCredential): Long {
+        return value.uniffiCloneHandle()
+    }
+
+    override fun lift(value: Long): AgeVerGapCredential {
+        return AgeVerGapCredential(UniffiWithHandle, value)
+    }
+
+    override fun read(buf: ByteBuffer): AgeVerGapCredential {
+        return lift(buf.getLong())
+    }
+
+    override fun allocationSize(value: AgeVerGapCredential) = 8UL
+
+    override fun write(value: AgeVerGapCredential, buf: ByteBuffer) {
         buf.putLong(lower(value))
     }
 }
@@ -2848,10 +3176,94 @@ public object FfiConverterTypeAgeVerError : FfiConverterRustBuffer<AgeVerExcepti
     }
 
 }
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterOptionalTypeAgeVerGapCredential: FfiConverterRustBuffer<AgeVerGapCredential?> {
+    override fun read(buf: ByteBuffer): AgeVerGapCredential? {
+        if (buf.get().toInt() == 0) {
+            return null
+        }
+        return FfiConverterTypeAgeVerGapCredential.read(buf)
+    }
+
+    override fun allocationSize(value: AgeVerGapCredential?): ULong {
+        if (value == null) {
+            return 1UL
+        } else {
+            return 1UL + FfiConverterTypeAgeVerGapCredential.allocationSize(value)
+        }
+    }
+
+    override fun write(value: AgeVerGapCredential?, buf: ByteBuffer) {
+        if (value == null) {
+            buf.put(0)
+        } else {
+            buf.put(1)
+            FfiConverterTypeAgeVerGapCredential.write(value, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterSequenceTypeAgeVerGapCredential: FfiConverterRustBuffer<List<AgeVerGapCredential>> {
+    override fun read(buf: ByteBuffer): List<AgeVerGapCredential> {
+        val len = buf.getInt()
+        return List<AgeVerGapCredential>(len) {
+            FfiConverterTypeAgeVerGapCredential.read(buf)
+        }
+    }
+
+    override fun allocationSize(value: List<AgeVerGapCredential>): ULong {
+        val sizeForLength = 4UL
+        val sizeForItems = value.map { FfiConverterTypeAgeVerGapCredential.allocationSize(it) }.sum()
+        return sizeForLength + sizeForItems
+    }
+
+    override fun write(value: List<AgeVerGapCredential>, buf: ByteBuffer) {
+        buf.putInt(value.size)
+        value.iterator().forEach {
+            FfiConverterTypeAgeVerGapCredential.write(it, buf)
+        }
+    }
+}
     @Throws(AgeVerException::class) fun `credentialFromJwt`(`s`: kotlin.String): AgeVerCredential {
             return FfiConverterTypeAgeVerCredential.lift(
     uniffiRustCallWithError(AgeVerException) { _status ->
     UniffiLib.uniffi_agever_fn_func_credential_from_jwt(
+    
+        FfiConverterString.lower(`s`),_status)
+}
+    )
+    }
+    
+
+        /**
+         * Holder-side scan: finds the gap (if any) whose hidden bounds strictly bracket `uid`.
+         */ fun `findBracket`(`gaps`: List<AgeVerGapCredential>, `uid`: kotlin.ULong): AgeVerGapCredential? {
+            return FfiConverterOptionalTypeAgeVerGapCredential.lift(
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_agever_fn_func_find_bracket(
+    
+        FfiConverterSequenceTypeAgeVerGapCredential.lower(`gaps`),FfiConverterULong.lower(`uid`),_status)
+}
+    )
+    }
+    
+
+    @Throws(AgeVerException::class) fun `gapCredentialFromJwt`(`s`: kotlin.String): AgeVerGapCredential {
+            return FfiConverterTypeAgeVerGapCredential.lift(
+    uniffiRustCallWithError(AgeVerException) { _status ->
+    UniffiLib.uniffi_agever_fn_func_gap_credential_from_jwt(
     
         FfiConverterString.lower(`s`),_status)
 }
@@ -2879,12 +3291,12 @@ public object FfiConverterTypeAgeVerError : FfiConverterRustBuffer<AgeVerExcepti
     }
     
 
-    @Throws(AgeVerException::class) fun `genPresentation`(`cred`: AgeVerCredential, `holderPk`: AgeVerHolderPublicKey, `today`: kotlin.ULong, `nonce`: kotlin.ByteArray, `holderSig`: AgeVerSignature): AgeVerPresentation {
+    @Throws(AgeVerException::class) fun `genPresentation`(`cred`: AgeVerCredential, `holderPk`: AgeVerHolderPublicKey, `today`: kotlin.ULong, `nonce`: kotlin.ByteArray, `holderSig`: AgeVerSignature, `gapCred`: AgeVerGapCredential): AgeVerPresentation {
             return FfiConverterTypeAgeVerPresentation.lift(
     uniffiRustCallWithError(AgeVerException) { _status ->
     UniffiLib.uniffi_agever_fn_func_gen_presentation(
     
-        FfiConverterTypeAgeVerCredential.lower(`cred`),FfiConverterTypeAgeVerHolderPublicKey.lower(`holderPk`),FfiConverterULong.lower(`today`),FfiConverterByteArray.lower(`nonce`),FfiConverterTypeAgeVerSignature.lower(`holderSig`),_status)
+        FfiConverterTypeAgeVerCredential.lower(`cred`),FfiConverterTypeAgeVerHolderPublicKey.lower(`holderPk`),FfiConverterULong.lower(`today`),FfiConverterByteArray.lower(`nonce`),FfiConverterTypeAgeVerSignature.lower(`holderSig`),FfiConverterTypeAgeVerGapCredential.lower(`gapCred`),_status)
 }
     )
     }
