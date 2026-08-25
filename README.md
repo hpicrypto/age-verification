@@ -55,6 +55,10 @@ An Axum HTTP server that acts as both issuer and verifier in the demo flow:
 | `POST /issue` | Verify Android Key Attestation cert chain, issue a JWT credential |
 | `GET /ageverification` | Create a session and display a QR code / deep-link |
 | `POST /validate` | Verify a `AgeVerPresentation` ZK proof, mark session valid |
+| `GET /revocation-status` | Publish the current epoch, revoked handles, and gap credential list |
+| `POST /admin/revoke` | Revoke a `rev_handle`, bump the epoch, re-sign the gap list — guarded by `X-Admin-Secret` when `ADMIN_SECRET` is set |
+| `GET /admin` | Browser page listing every issued credential (name, age, above16/above18, issued time, Active/Revoked) with checkboxes to select several and revoke them together |
+| `POST /admin/revoke-bulk` | Form target for the `/admin` page — revokes every checked handle in one request |
 
 The `/issue` endpoint verifies the Android StrongBox Key Attestation certificate chain
 (Google EC + RSA roots) before issuing a credential, binding the credential to the
@@ -64,9 +68,11 @@ hardware-attested P-256 key of the wallet.
 
 | Variable | Default | Description |
 |---|---|---|
-| `ISSUER_SECRET` | *(OS RNG)* | Exactly 32-byte ASCII string used as the seed for deterministic issuer keypair generation. If unset, the keypair is sampled from the OS RNG on every start. |
+| `ISSUER_SECRET` | *(OS RNG)* | Exactly 32-byte ASCII string used as the seed for deterministic issuer keypair generation. If unset, the keypair is sampled from the OS RNG on every start — restarting without a fixed secret invalidates every previously-issued credential. |
 | `REQUIRE_ATTEST` | `true` | Set to `false` or `0` to skip the Android StrongBox security-level check. |
 | `EXTRA_TRUST_CERTS_PEM_FILE` | *(none)* | Path to a PEM file containing additional X.509 trust anchors. |
+| `ADMIN_SECRET` | *(none)* | When set, required to call `POST /admin/revoke` (via the `X-Admin-Secret` header) and to view/use `/admin` and `/admin/revoke-bulk` (via HTTP Basic Auth, since a browser form can't send a custom header — username is ignored, password must match). When unset, all three are open to anyone who can reach them. |
+| `SEED_REVOKED_COUNT` | `2000` | Number of synthetic revoked handles seeded at startup, so the demo starts with a realistically large gap list instead of an empty one. |
 
 
 ### `wallet`

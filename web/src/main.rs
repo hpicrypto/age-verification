@@ -1,5 +1,5 @@
 use ark_std::rand::{SeedableRng, rngs::StdRng};
-use rand::RngCore;
+use rand::{Rng, RngCore};
 use axum::{
     Router, extract::{Form, Json, State}, http::{HeaderMap, StatusCode}, response::{Html, IntoResponse, Redirect}, routing::{get, post}
 };
@@ -46,9 +46,13 @@ struct AppState {
     require_attestation: bool,
     status_manager: StatusManager,
     revocation: Mutex<RevocationState>,
-    /// When set, required (via the X-Admin-Secret header) to call /admin/revoke. When unset,
-    /// the endpoint is open - matches require_attestation's permissive-unless-configured default.
+    /// When set, required (via the X-Admin-Secret header on the JSON API, or HTTP Basic Auth on
+    /// the /admin page and its form endpoint) to revoke a handle or view /admin. When unset,
+    /// these are open - matches require_attestation's permissive-unless-configured default.
     admin_secret: Option<String>,
+    /// Every credential issued so far, for the /admin page. Purely informational - nothing else
+    /// reads this.
+    issued: Mutex<Vec<IssuedCredential>>,
 }
 
 struct RevocationState {
@@ -57,10 +61,27 @@ struct RevocationState {
     gap_list: Vec<GapCredential>,
 }
 
+struct IssuedCredential {
+    rev_handle: u64,
+    name: String,
+    age: u64,
+    issued_at: chrono::DateTime<chrono::Utc>,
+}
+
 /// Synthetic revoked handles seeded at startup live at/above this value, far above the range of
-/// real issued rev_handles (which start at 1 and increment by 1). Used to filter them out of the
+/// real issued rev_handles (which are sampled uniformly at random from the full u64 space, so
+/// collision with this narrow band is astronomically unlikely). Used to filter them out of the
 /// human-readable /revocation-status view so a real revoke's effect isn't buried in the noise.
 const SEED_REVOKED_BASE: u64 = 1_000_000;
+
+// Combined at random (FIRST_NAMES.len() * LAST_NAMES.len() = 100 possible full names)
+// rather than picked as fixed whole names, for more variety without a huge literal list.
+const FIRST_NAMES: &[&str] = &[
+    "John", "Jane", "Alex", "Sam", "Priya", "Chen", "Fatima", "Liam", "Yuki", "Maria",
+];
+const LAST_NAMES: &[&str] = &[
+    "Doe", "Smith", "Kim", "Rivera", "Patel", "Wei", "Al-Sayed", "O'Connor", "Tanaka", "Rossi",
+];
 
 type SharedState = Arc<AppState>;
 
@@ -164,6 +185,7 @@ fn build_state() -> SharedState {
         status_manager,
         revocation: Mutex::new(RevocationState { epoch: initial_epoch, revoked: seeded_revoked, gap_list: initial_gap_list }),
         admin_secret,
+        issued: Mutex::new(Vec::new()),
     })
 }
 
@@ -195,6 +217,8 @@ fn build_app(state: SharedState) -> Router {
         .route("/issue", post(issue))
         .route("/revocation-status", get(revocation_status))
         .route("/admin/revoke", post(admin_revoke))
+        .route("/admin", get(admin_page))
+        .route("/admin/revoke-bulk", post(admin_revoke_bulk))
         .layer(
             // DEBUG, not INFO: per-request tracing (including routine polling like the QR
             // page's 1s /status loop) would otherwise flood the default log. The app's own
@@ -277,11 +301,24 @@ async fn issue(
     // Sampled uniformly from the full u64 space rather than assigned sequentially, so the
     // handle can't be used to infer issuance order or volume.
     let rev_handle = rand::thread_rng().next_u64();
-    tracing::info!(rev_handle, "issuing credential");
+    let first = FIRST_NAMES[rand::thread_rng().gen_range(0..FIRST_NAMES.len())];
+    let last = LAST_NAMES[rand::thread_rng().gen_range(0..LAST_NAMES.len())];
+    let name = format!("{first} {last}");
+    // Spans under-16, 16-17, and 18+ so above16/above18 actually vary between issuances.
+    let age = rand::thread_rng().gen_range(10..90);
+    tracing::info!(rev_handle, name, age, "issuing credential");
 
-    let cred = state.issuer.issue_credential("John Doe".to_string(), 20, holder_pk, rev_handle);
+    let cred = state.issuer.issue_credential(name.clone(), age, holder_pk, rev_handle);
     match cred {
-        Ok(c) => c.to_jwt().into_response(),
+        Ok(c) => {
+            state.issued.lock().unwrap().push(IssuedCredential {
+                rev_handle,
+                name,
+                age,
+                issued_at: chrono::Utc::now(),
+            });
+            c.to_jwt().into_response()
+        }
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("credential issuance failed: {e:?}")).into_response(),
     }
 }
@@ -347,6 +384,21 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
+/// Revokes a handle, bumps the epoch, and re-signs the gap list. Shared by the JSON
+/// (curl-friendly) and form (browser-friendly) revoke endpoints.
+fn do_revoke(state: &SharedState, rev_handle: u64) -> Result<u64, String> {
+    let mut rev = state.revocation.lock().unwrap();
+    rev.revoked.insert(rev_handle);
+    rev.epoch += 1;
+    tracing::info!(rev_handle, epoch = rev.epoch, "revoking handle");
+    let new_gap_list = state
+        .status_manager
+        .revoke(rev.epoch, rev.revoked.iter().cloned().collect())
+        .map_err(|e| format!("re-signing gap list failed: {e:?}"))?;
+    rev.gap_list = new_gap_list;
+    Ok(rev.epoch)
+}
+
 async fn admin_revoke(
     State(state): State<SharedState>,
     headers: HeaderMap,
@@ -360,17 +412,128 @@ async fn admin_revoke(
         }
     }
 
-    let mut rev = state.revocation.lock().unwrap();
-    rev.revoked.insert(req.rev_handle);
-    rev.epoch += 1;
-    tracing::info!(rev_handle = req.rev_handle, epoch = rev.epoch, "revoking handle");
-    let new_gap_list = match state.status_manager.revoke(rev.epoch, rev.revoked.iter().cloned().collect()) {
-        Ok(list) => list,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("re-signing gap list failed: {e:?}")).into_response(),
-    };
-    rev.gap_list = new_gap_list;
+    match do_revoke(&state, req.rev_handle) {
+        Ok(epoch) => Json(serde_json::json!({ "epoch": epoch })).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
+}
 
-    Json(serde_json::json!({ "epoch": rev.epoch })).into_response()
+/// Checks the Authorization header against admin_secret using HTTP Basic Auth (username
+/// ignored, only the password is compared) - the browser-facing equivalent of the JSON API's
+/// X-Admin-Secret header, since a plain HTML form can't set a custom header. Returns true when
+/// admin_secret is unset, matching the JSON API's permissive-unless-configured default.
+fn check_basic_auth(state: &SharedState, headers: &HeaderMap) -> bool {
+    let Some(expected) = &state.admin_secret else { return true };
+    let Some(auth) = headers.get(http::header::AUTHORIZATION).and_then(|v| v.to_str().ok()) else { return false };
+    let Some(b64) = auth.strip_prefix("Basic ") else { return false };
+    let Ok(decoded) = BASE64_STANDARD.decode(b64) else { return false };
+    let Ok(decoded) = String::from_utf8(decoded) else { return false };
+    let Some((_, password)) = decoded.split_once(':') else { return false };
+    constant_time_eq(password.as_bytes(), expected.as_bytes())
+}
+
+fn basic_auth_challenge() -> axum::response::Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        [(http::header::WWW_AUTHENTICATE, r#"Basic realm="admin""#)],
+        "authentication required",
+    )
+        .into_response()
+}
+
+/// Revokes every handle checked on the /admin page in one go. Each checkbox is named
+/// `revoke_<handle>` (rather than sharing one `rev_handle` field name) because a plain HTML
+/// form has no native way to submit a variable-length list of values under one field name -
+/// axum's Form extractor can deserialize into a HashMap<String, String> though, so this reads
+/// the handle back out of each checked box's own field name.
+async fn admin_revoke_bulk(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    Form(fields): Form<HashMap<String, String>>,
+) -> impl IntoResponse {
+    if !check_basic_auth(&state, &headers) {
+        return basic_auth_challenge();
+    }
+    let handles: Vec<u64> = fields
+        .keys()
+        .filter_map(|k| k.strip_prefix("revoke_"))
+        .filter_map(|s| s.parse::<u64>().ok())
+        .collect();
+    for handle in handles {
+        if let Err(e) = do_revoke(&state, handle) {
+            return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+        }
+    }
+    Redirect::to("/admin").into_response()
+}
+
+async fn admin_page(State(state): State<SharedState>, headers: HeaderMap) -> impl IntoResponse {
+    if !check_basic_auth(&state, &headers) {
+        return basic_auth_challenge();
+    }
+
+    let issued = state.issued.lock().unwrap();
+    let rev = state.revocation.lock().unwrap();
+
+    let rows: String = issued
+        .iter()
+        .rev()
+        .map(|c| {
+            let is_revoked = rev.revoked.contains(&c.rev_handle);
+            let select_cell = if is_revoked {
+                "—".to_string()
+            } else {
+                format!(r#"<input type="checkbox" name="revoke_{}">"#, c.rev_handle)
+            };
+            format!(
+                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+                select_cell,
+                c.rev_handle,
+                c.name,
+                c.age,
+                c.age >= 16,
+                c.age >= 18,
+                c.issued_at.format("%Y-%m-%d %H:%M:%S UTC"),
+                if is_revoked { "Revoked" } else { "Active" },
+            )
+        })
+        .collect();
+
+    Html(admin_html(rev.epoch, rev.revoked.len(), &rows)).into_response()
+}
+
+fn admin_html(epoch: u64, revoked_count: usize, rows: &str) -> String {
+    format!(
+        r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Admin</title>
+  <style>
+    body {{ font-family: sans-serif; max-width: 900px; margin: 2rem auto; padding: 0 1rem; }}
+    table {{ border-collapse: collapse; width: 100%; margin-top: 1rem; }}
+    th, td {{ text-align: left; padding: 0.4em 0.8em; border-bottom: 1px solid #ddd; }}
+    th {{ background: #f0f0f0; }}
+    button {{ margin-top: 1rem; padding: 0.4em 1.2em; }}
+  </style>
+</head>
+<body>
+  <h1>Admin</h1>
+  <p>Epoch: <strong>{epoch}</strong> &middot; Revoked handles: <strong>{revoked_count}</strong></p>
+  <form method="POST" action="/admin/revoke-bulk">
+    <table>
+      <thead>
+        <tr><th></th><th>Handle</th><th>Name</th><th>Age</th><th>Above 16</th><th>Above 18</th><th>Issued at</th><th>Status</th></tr>
+      </thead>
+      <tbody>
+        {rows}
+      </tbody>
+    </table>
+    <button type="submit">Revoke Selected</button>
+  </form>
+</body>
+</html>"#
+    )
 }
 
 async fn status(State(state): State<SharedState>, jar: CookieJar) -> Json<serde_json::Value> {
@@ -595,6 +758,7 @@ mod tests {
             status_manager,
             revocation: Mutex::new(RevocationState { epoch: initial_epoch, revoked: BTreeSet::new(), gap_list: initial_gap_list }),
             admin_secret: admin_secret.map(String::from),
+            issued: Mutex::new(Vec::new()),
         });
 
         (state, holder_keypair, cert_b64)
@@ -809,5 +973,114 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body: serde_json::Value = serde_json::from_str(&body_string(response).await).unwrap();
         assert_eq!(body["epoch"], 2);
+    }
+
+    #[tokio::test]
+    async fn test_admin_page_lists_issued_credentials() {
+        let (state, _holder_keypair, cert_b64) = build_test_state_with_cert(None);
+
+        let issue_body = serde_json::json!({ "cert_chain": [cert_b64] }).to_string();
+        let response = build_app(Arc::clone(&state))
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/issue")
+                    .header("content-type", "application/json")
+                    .body(Body::from(issue_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let cred = Credential::from_jwt(&body_string(response).await).unwrap();
+        let rev_handle = cred.rev_handle().unwrap();
+
+        let response = build_app(Arc::clone(&state))
+            .oneshot(Request::builder().uri("/admin").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_string(response).await;
+        assert!(body.contains(&rev_handle.to_string()), "admin page should list the issued handle");
+    }
+
+    #[tokio::test]
+    async fn test_admin_requires_basic_auth_when_secret_set() {
+        let (state, _holder_keypair, _cert_b64) = build_test_state_with_cert(Some("test-secret"));
+
+        // No auth: rejected with a challenge a browser can act on.
+        let response = build_app(Arc::clone(&state))
+            .oneshot(Request::builder().uri("/admin").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert!(response.headers().contains_key("www-authenticate"));
+
+        // Correct Basic auth (username ignored, password = admin_secret): accepted.
+        let creds = BASE64_STANDARD.encode("admin:test-secret");
+        let response = build_app(Arc::clone(&state))
+            .oneshot(
+                Request::builder()
+                    .uri("/admin")
+                    .header("authorization", format!("Basic {creds}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_admin_revoke_bulk_redirects_and_revokes_multiple() {
+        let (state, _holder_keypair, cert_b64) = build_test_state_with_cert(None);
+
+        let mut handles = Vec::new();
+        for _ in 0..2 {
+            let issue_body = serde_json::json!({ "cert_chain": [cert_b64] }).to_string();
+            let response = build_app(Arc::clone(&state))
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/issue")
+                        .header("content-type", "application/json")
+                        .body(Body::from(issue_body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let cred = Credential::from_jwt(&body_string(response).await).unwrap();
+            handles.push(cred.rev_handle().unwrap());
+        }
+
+        let form_body = handles
+            .iter()
+            .map(|h| format!("revoke_{h}=on"))
+            .collect::<Vec<_>>()
+            .join("&");
+        let response = build_app(Arc::clone(&state))
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/revoke-bulk")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from(form_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(response.headers().get("location").unwrap(), "/admin");
+
+        let response = build_app(Arc::clone(&state))
+            .oneshot(Request::builder().uri("/admin").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let body = body_string(response).await;
+        // The row status cell renders as "<td>Revoked</td>" - matching that exactly (rather
+        // than the bare word, which also appears once in the "Revoked handles: N" summary line)
+        // counts only actual per-row statuses.
+        let revoked_count = body.matches("<td>Revoked</td>").count();
+        assert_eq!(revoked_count, 2, "both credentials should show as Revoked on the admin page");
     }
 }
