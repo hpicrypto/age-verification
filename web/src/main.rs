@@ -249,8 +249,9 @@ async fn ageverification(State(state): State<SharedState>, jar: CookieJar) -> im
     if let Some(c) = jar.get("session_id") {
         let sessions = state.sessions.lock().unwrap();
         if sessions.get(c.value()).copied() == Some(true) {
+            let id = c.value().to_string();
             drop(sessions);
-            return Redirect::to(".").into_response();
+            return Html(welcome_html(&id)).into_response();
         }
         if sessions.contains_key(c.value()) {
             let id = c.value().to_string();
@@ -270,7 +271,7 @@ async fn logout(State(state): State<SharedState>, jar: CookieJar) -> impl IntoRe
         state.sessions.lock().unwrap().remove(c.value());
     }
     let jar = jar.remove(Cookie::from("session_id"));
-    (jar, Redirect::to("."))
+    (jar, Redirect::to("/ageverification"))
 }
 
 #[derive(Deserialize, Debug)]
@@ -591,7 +592,7 @@ fn pending_html(session_id: &str) -> String {
     setInterval(async () => {{
       const res = await fetch('status');
       const data = await res.json();
-      if (data.validated) window.location.href = '.';
+            if (data.validated) window.location.href = '/ageverification';
     }}, 1000);
   </script>
 </body>
@@ -892,11 +893,11 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
 
-        // Step 4: GET / with session cookie — should show Welcome
+        // Step 4: GET /ageverification with session cookie — should show Welcome
         let response = build_app(Arc::clone(&state))
             .oneshot(
                 Request::builder()
-                    .uri("/")
+                    .uri("/ageverification")
                     .header("cookie", format!("session_id={session_id}"))
                     .body(Body::empty())
                     .unwrap(),
