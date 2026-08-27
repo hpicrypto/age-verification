@@ -7,7 +7,10 @@ by A. Lehmann, A. Sidorenko, and A. Zacharakis.
 
 The concrete use case is age verification: a credential holder proves they are 18 years
 old without revealing any other attribute, and without the verifier being able to track or
-link individual presentations. 
+link individual presentations.
+
+A current deployed version of the demo is available at
+[av-demo.hpi.de](https://av-demo.hpi.de).
 
 ## Structure
 
