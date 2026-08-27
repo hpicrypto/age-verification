@@ -11,6 +11,8 @@ import androidx.compose.animation.*
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -159,31 +161,34 @@ class MainActivity : ComponentActivity() {
                     .build()
             }
 
-            val url1 = "http://127.0.0.1:3000/issue"
-            val url2 = "http://127.0.0.1:3000/validate"
-            val url3 = "http://127.0.0.1:3000/revocation-status"
+            val url1 = "http://127.0.0.1/issue"
+            val url2 = "http://127.0.0.1/validate"
+            val url3 = "http://127.0.0.1/revocation-status"
 
             fun updateRevocationStatus() {
                 isUpdatingRevocation = true
                 revocationUpdateError = null
+                val currentCredentials = credentials
                 scope.launch {
                     try {
                         val start = System.currentTimeMillis()
-                        val gapResult = withContext(Dispatchers.IO) {
+                        val (freshGapList, freshValidityByHandle) = withContext(Dispatchers.IO) {
                             val request = Request.Builder().url(url3).get().build()
-                            client.newCall(request).execute().use { response ->
+                            val gapResult = client.newCall(request).execute().use { response ->
                                 if (response.isSuccessful) response.body?.string() else
                                     throw Exception(response.body?.string())
                             }
-                        }
-                        val gapsJson = JSONObject(gapResult.orEmpty()).getJSONArray("gaps")
-                        val freshGapList = (0 until gapsJson.length()).map { i ->
-                            uniffi.agever.gapCredentialFromJwt(gapsJson.getString(i))
+                            val gapsJson = JSONObject(gapResult.orEmpty()).getJSONArray("gaps")
+                            val parsedGapList = (0 until gapsJson.length()).map { i ->
+                                uniffi.agever.gapCredentialFromJwt(gapsJson.getString(i))
+                            }
+                            val parsedValidityByHandle = currentCredentials.associate { cred ->
+                                cred.revHandle() to (uniffi.agever.findBracket(parsedGapList, cred.revHandle()) != null)
+                            }
+                            parsedGapList to parsedValidityByHandle
                         }
                         gapList = freshGapList
-                        validityByHandle = credentials.associate { cred ->
-                            cred.revHandle() to (uniffi.agever.findBracket(freshGapList, cred.revHandle()) != null)
-                        }
+                        validityByHandle = freshValidityByHandle
                         revocationUpdateTime = System.currentTimeMillis() - start
                     } catch (e: Exception) {
                         revocationUpdateError = e.message
@@ -321,6 +326,8 @@ class MainActivity : ComponentActivity() {
                                 keyManager = keyManager,
                                 client = client,
                                 url = url2,
+                                isRefreshingStatus = isUpdatingRevocation,
+                                onRefreshStatus = { updateRevocationStatus() },
                                 onFinish = { success, msg ->
                                     if (!success) {
                                         errorMessage = msg
@@ -363,7 +370,9 @@ fun DemoScreen(
     val selectedValid = selectedHandle?.let { validityByHandle[it] }
 
     Column(
-        modifier = modifier.padding(24.dp),
+        modifier = modifier
+            .padding(24.dp)
+            .verticalScroll(rememberScrollState()),
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.Top
     ) {
@@ -609,6 +618,8 @@ fun PresentationScreen(
     keyManager: HardwareKeyManager,
     client: OkHttpClient,
     url: String,
+    isRefreshingStatus: Boolean,
+    onRefreshStatus: () -> Unit,
     onFinish: (Boolean, String?) -> Unit
 ) {
     var isConfirmed by remember { mutableStateOf(false) }
@@ -621,6 +632,9 @@ fun PresentationScreen(
     var verificationTime by remember { mutableStateOf<Long?>(null) }
 
     val scope = rememberCoroutineScope()
+    val selectedValid = credential?.revHandle()?.let { revHandle ->
+        gapList?.let { gaps -> uniffi.agever.findBracket(gaps, revHandle) != null }
+    }
 
     fun startPresentation() {
         isConfirmed = true
@@ -758,6 +772,34 @@ fun PresentationScreen(
 
                 Spacer(modifier = Modifier.height(32.dp))
 
+                StatusRow(
+                    label = "Status",
+                    isOk = selectedValid == true,
+                    loading = isRefreshingStatus,
+                    subtitle = when {
+                        credential == null -> null
+                        selectedValid == false -> "This credential is no longer valid"
+                        selectedValid == true -> "Status refreshed"
+                        gapList != null -> "Refresh to check this credential"
+                        else -> "Not fetched yet"
+                    },
+                    icon = if (selectedValid == false) Icons.Default.Cancel
+                        else if (selectedValid == true) Icons.Default.CheckCircle
+                        else Icons.Default.Error
+                )
+
+                Spacer(modifier = Modifier.height(16.dp))
+
+                Button(
+                    modifier = Modifier.fillMaxWidth().height(56.dp),
+                    enabled = !isRefreshingStatus,
+                    onClick = onRefreshStatus
+                ) {
+                    Text(if (isRefreshingStatus) "Refreshing Status..." else "Refresh Status")
+                }
+
+                Spacer(modifier = Modifier.height(12.dp))
+
                 Button(
                     modifier = Modifier.fillMaxWidth().height(56.dp),
                     enabled = gapList != null,
@@ -800,7 +842,7 @@ fun PresentationScreen(
                     Spacer(modifier = Modifier.height(16.dp))
                     Column(horizontalAlignment = Alignment.CenterHorizontally) {
                         Text(
-                            text = "Signing: ${signingTime}ms",
+                            text = "Device signing: ${signingTime}ms",
                             style = MaterialTheme.typography.labelSmall,
                             color = MaterialTheme.colorScheme.outline
                         )
