@@ -8,6 +8,9 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
 import androidx.compose.animation.*
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.lazy.LazyRow
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -19,11 +22,13 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Cancel
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Error
 import androidx.compose.material.icons.filled.Key
 import androidx.compose.material.icons.filled.QrCodeScanner
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CardDefaults
@@ -78,6 +83,7 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import uniffi.agever.AgeVerCredential
+import uniffi.agever.AgeVerGapCredential
 import uniffi.agever.AgeVerHolderPublicKey
 import java.math.BigInteger
 import java.security.interfaces.ECPublicKey
@@ -125,11 +131,21 @@ class MainActivity : ComponentActivity() {
                 }
             }
 
-            var credential by remember { mutableStateOf<AgeVerCredential?>(null) }
+            var credentials by remember { mutableStateOf<List<AgeVerCredential>>(emptyList()) }
+            var selectedHandle by remember { mutableStateOf<ULong?>(null) }
             var holderPublicKey by remember { mutableStateOf<AgeVerHolderPublicKey?>(null) }
             var isHardwareBacked by remember { mutableStateOf(false) }
             var isFetching by remember { mutableStateOf(false) }
             var errorMessage by remember { mutableStateOf<String?>(null) }
+
+            var gapList by remember { mutableStateOf<List<AgeVerGapCredential>?>(null) }
+            var isUpdatingRevocation by remember { mutableStateOf(false) }
+            var revocationUpdateTime by remember { mutableStateOf<Long?>(null) }
+            var revocationUpdateError by remember { mutableStateOf<String?>(null) }
+            // Only entries for credentials that have actually been checked against a fetched
+            // gap list are present here - absence (not false) means "not checked yet".
+            var validityByHandle by remember { mutableStateOf<Map<ULong, Boolean>>(emptyMap()) }
+            val scope = rememberCoroutineScope()
 
             val context = androidx.compose.ui.platform.LocalContext.current
             val keyManager = remember { HardwareKeyManager(context) }
@@ -143,8 +159,73 @@ class MainActivity : ComponentActivity() {
                     .build()
             }
 
-            val url1 = "https://av-demo.hpi.de/issue"
-            val url2 = "https://av-demo.hpi.de/validate"
+            val url1 = "http://127.0.0.1:3000/issue"
+            val url2 = "http://127.0.0.1:3000/validate"
+            val url3 = "http://127.0.0.1:3000/revocation-status"
+
+            fun updateRevocationStatus() {
+                isUpdatingRevocation = true
+                revocationUpdateError = null
+                scope.launch {
+                    try {
+                        val start = System.currentTimeMillis()
+                        val gapResult = withContext(Dispatchers.IO) {
+                            val request = Request.Builder().url(url3).get().build()
+                            client.newCall(request).execute().use { response ->
+                                if (response.isSuccessful) response.body?.string() else
+                                    throw Exception(response.body?.string())
+                            }
+                        }
+                        val gapsJson = JSONObject(gapResult.orEmpty()).getJSONArray("gaps")
+                        val freshGapList = (0 until gapsJson.length()).map { i ->
+                            uniffi.agever.gapCredentialFromJwt(gapsJson.getString(i))
+                        }
+                        gapList = freshGapList
+                        validityByHandle = credentials.associate { cred ->
+                            cred.revHandle() to (uniffi.agever.findBracket(freshGapList, cred.revHandle()) != null)
+                        }
+                        revocationUpdateTime = System.currentTimeMillis() - start
+                    } catch (e: Exception) {
+                        revocationUpdateError = e.message
+                    } finally {
+                        isUpdatingRevocation = false
+                    }
+                }
+            }
+
+            fun requestNewCredential() {
+                isFetching = true
+                errorMessage = null
+                scope.launch {
+                    try {
+                        val result = withContext(Dispatchers.IO) {
+                            val chain = keyManager.getCertificateChain()
+                            val certsBase64 = chain.map {
+                                android.util.Base64.encodeToString(it.encoded, android.util.Base64.NO_WRAP)
+                            }
+                            Log.d("MainActivity", "Requesting credential with chain: $certsBase64")
+
+                            val jsonBody = JSONObject().apply {
+                                put("cert_chain", JSONArray(certsBase64))
+                            }
+                            val requestBody = jsonBody.toString()
+                                .toRequestBody("application/json; charset=utf-8".toMediaType())
+                            val request = Request.Builder().url(url1).post(requestBody).build()
+                            client.newCall(request).execute().use { response ->
+                                if (response.isSuccessful) response.body?.string() else
+                                    throw Exception(response.body?.string())
+                            }
+                        }
+                        val newCredential = uniffi.agever.credentialFromJwt(result.orEmpty())
+                        credentials = credentials + newCredential
+                        selectedHandle = newCredential.revHandle()
+                    } catch (e: Exception) {
+                        errorMessage = e.message
+                    } finally {
+                        isFetching = false
+                    }
+                }
+            }
 
             LaunchedEffect(Unit) {
                 if (!cameraPermissionState.status.isGranted) {
@@ -165,34 +246,7 @@ class MainActivity : ComponentActivity() {
                     errorMessage = "Key error: ${e.message}"
                 }
 
-
-
-                try {
-                    isFetching = true
-                    val result = withContext(Dispatchers.IO) {
-                        val chain = keyManager.getCertificateChain()
-                        val certsBase64 = chain.map {
-                            android.util.Base64.encodeToString(it.encoded, android.util.Base64.NO_WRAP)
-                        }
-                        Log.d("MainActivity", "Requesting credential with chain: $certsBase64")
-
-                        val jsonBody = JSONObject().apply {
-                            put("cert_chain", JSONArray(certsBase64))
-                        }
-                        val requestBody = jsonBody.toString()
-                            .toRequestBody("application/json; charset=utf-8".toMediaType())
-                        val request = Request.Builder().url(url1).post(requestBody).build()
-                        client.newCall(request).execute().use { response ->
-                            if (response.isSuccessful) response.body?.string() else
-                                throw Exception(response.body?.string())
-                        }
-                    }
-                    credential = uniffi.agever.credentialFromJwt(result.orEmpty())
-                } catch (e: Exception) {
-                    errorMessage = e.message
-                } finally {
-                    isFetching = false
-                }
+                requestNewCredential()
             }
 
             WalletTheme {
@@ -229,14 +283,23 @@ class MainActivity : ComponentActivity() {
                                     modifier = Modifier
                                         .padding(innerPadding)
                                         .fillMaxSize(),
-                                    credential = credential,
+                                    credentials = credentials,
+                                    selectedHandle = selectedHandle,
+                                    onSelectHandle = { selectedHandle = it },
                                     holderPublicKey = holderPublicKey,
                                     isHardwareBacked = isHardwareBacked,
                                     isFetching = isFetching,
                                     errorMessage = errorMessage,
-                                    onNavigateToScanner = { 
+                                    gapList = gapList,
+                                    isUpdatingRevocation = isUpdatingRevocation,
+                                    revocationUpdateTime = revocationUpdateTime,
+                                    revocationUpdateError = revocationUpdateError,
+                                    validityByHandle = validityByHandle,
+                                    onUpdateRevocation = { updateRevocationStatus() },
+                                    onRequestNewCredential = { requestNewCredential() },
+                                    onNavigateToScanner = {
                                         errorMessage = null
-                                        currentScreen = AppScreen.Scanner 
+                                        currentScreen = AppScreen.Scanner
                                     }
                                 )
                             }
@@ -252,7 +315,8 @@ class MainActivity : ComponentActivity() {
                         is AppScreen.Presentation -> {
                             PresentationScreen(
                                 sessionId = screen.sessionId,
-                                credential = credential,
+                                credential = credentials.find { it.revHandle() == selectedHandle },
+                                gapList = gapList,
                                 holderPublicKey = holderPublicKey,
                                 keyManager = keyManager,
                                 client = client,
@@ -279,13 +343,25 @@ class MainActivity : ComponentActivity() {
 @Composable
 fun DemoScreen(
     modifier: Modifier = Modifier,
-    credential: AgeVerCredential?,
+    credentials: List<AgeVerCredential>,
+    selectedHandle: ULong?,
+    onSelectHandle: (ULong) -> Unit,
     holderPublicKey: AgeVerHolderPublicKey?,
     isHardwareBacked: Boolean,
     isFetching: Boolean,
     errorMessage: String?,
+    gapList: List<AgeVerGapCredential>?,
+    isUpdatingRevocation: Boolean,
+    revocationUpdateTime: Long?,
+    revocationUpdateError: String?,
+    validityByHandle: Map<ULong, Boolean>,
+    onUpdateRevocation: () -> Unit,
+    onRequestNewCredential: () -> Unit,
     onNavigateToScanner: () -> Unit
 ) {
+    val selectedCredential = credentials.find { it.revHandle() == selectedHandle }
+    val selectedValid = selectedHandle?.let { validityByHandle[it] }
+
     Column(
         modifier = modifier.padding(24.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
@@ -322,12 +398,50 @@ fun DemoScreen(
                 )
                 Spacer(modifier = Modifier.height(8.dp))
                 StatusRow(
-                    label = "Credential",
-                    isOk = credential != null,
-                    loading = isFetching
+                    label = "Credentials",
+                    isOk = credentials.isNotEmpty(),
+                    loading = isFetching,
+                    subtitle = if (credentials.isNotEmpty()) "${credentials.size} held" else null
+                )
+                Spacer(modifier = Modifier.height(8.dp))
+                StatusRow(
+                    label = "Status",
+                    isOk = selectedValid == true,
+                    loading = isUpdatingRevocation,
+                    subtitle = when {
+                        selectedCredential == null -> null
+                        revocationUpdateError != null -> revocationUpdateError
+                        selectedValid == false -> "This credential is no longer valid"
+                        selectedValid == true -> "Updated in ${revocationUpdateTime}ms"
+                        gapList != null -> "Refresh to check this credential"
+                        else -> "Not fetched yet"
+                    },
+                    icon = if (selectedValid == false) Icons.Default.Cancel
+                        else if (selectedValid == true) Icons.Default.CheckCircle
+                        else Icons.Default.Error
                 )
 
-                if (credential != null) {
+                if (credentials.isNotEmpty()) {
+                    Spacer(modifier = Modifier.height(16.dp))
+                    Text(
+                        text = "Held Credentials",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.outline
+                    )
+                    Spacer(modifier = Modifier.height(8.dp))
+                    LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        items(credentials, key = { it.revHandle().toString() }) { cred ->
+                            CredentialChip(
+                                credential = cred,
+                                isSelected = cred.revHandle() == selectedHandle,
+                                isValid = validityByHandle[cred.revHandle()],
+                                onClick = { onSelectHandle(cred.revHandle()) }
+                            )
+                        }
+                    }
+                }
+
+                if (selectedCredential != null) {
                     Spacer(modifier = Modifier.height(16.dp))
                     Text(
                         text = "Credential Details",
@@ -335,22 +449,42 @@ fun DemoScreen(
                         color = MaterialTheme.colorScheme.outline
                     )
                     Spacer(modifier = Modifier.height(8.dp))
-                    val claimsJson = remember(credential) {
-                        try { JSONObject(credential.claimsJsonStr()) } catch (e: Exception) { null }
+                    val claimsJson = remember(selectedCredential) {
+                        try { JSONObject(selectedCredential.claimsJsonStr()) } catch (e: Exception) { null }
                     }
                     claimsJson?.let { ClaimsList(it) }
                 }
             }
         }
 
-        Spacer(modifier = Modifier.height(32.dp))
+        Spacer(modifier = Modifier.height(16.dp))
+
+        Button(
+            modifier = Modifier.fillMaxWidth(),
+            enabled = !isFetching,
+            onClick = onRequestNewCredential
+        ) {
+            Text(if (credentials.isEmpty()) "Request Credential" else "Request New Credential")
+        }
+
+        Spacer(modifier = Modifier.height(16.dp))
+
+        Button(
+            modifier = Modifier.fillMaxWidth(),
+            enabled = !isUpdatingRevocation,
+            onClick = onUpdateRevocation
+        ) {
+            Text(if (gapList == null) "Update Status" else "Refresh Status")
+        }
+
+        Spacer(modifier = Modifier.height(16.dp))
 
         Button(
             modifier = Modifier
                 .fillMaxWidth()
                 .height(56.dp),
             onClick = onNavigateToScanner,
-            enabled = credential != null
+            enabled = selectedCredential != null && selectedValid == true
         ) {
             Icon(Icons.Default.QrCodeScanner, contentDescription = null)
             Spacer(modifier = Modifier.size(8.dp))
@@ -380,6 +514,54 @@ fun DemoScreen(
                         style = MaterialTheme.typography.bodyMedium
                     )
                 }
+            }
+        }
+    }
+}
+
+@Composable
+fun CredentialChip(
+    credential: AgeVerCredential,
+    isSelected: Boolean,
+    isValid: Boolean?,
+    onClick: () -> Unit
+) {
+    val claimsJson = remember(credential) {
+        try { JSONObject(credential.claimsJsonStr()) } catch (e: Exception) { null }
+    }
+    val name = claimsJson?.optJSONObject("name")?.optString("val") ?: "Credential"
+    val shortHandle = credential.revHandle().toString(16).takeLast(6)
+
+    ElevatedCard(
+        modifier = Modifier.clickable(onClick = onClick),
+        colors = CardDefaults.elevatedCardColors(
+            containerColor = if (isSelected) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surface
+        )
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Column {
+                Text(
+                    text = name,
+                    style = MaterialTheme.typography.bodyMedium,
+                    fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal
+                )
+                Text(
+                    text = "#$shortHandle",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.outline
+                )
+            }
+            if (isValid != null) {
+                Spacer(modifier = Modifier.size(6.dp))
+                Icon(
+                    imageVector = if (isValid) Icons.Default.CheckCircle else Icons.Default.Cancel,
+                    contentDescription = null,
+                    tint = if (isValid) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.error,
+                    modifier = Modifier.size(16.dp)
+                )
             }
         }
     }
@@ -422,6 +604,7 @@ fun ScannerScreen(
 fun PresentationScreen(
     sessionId: String,
     credential: AgeVerCredential?,
+    gapList: List<AgeVerGapCredential>?,
     holderPublicKey: AgeVerHolderPublicKey?,
     keyManager: HardwareKeyManager,
     client: OkHttpClient,
@@ -433,8 +616,10 @@ fun PresentationScreen(
     var resultMessage by remember { mutableStateOf<String?>(null) }
     var success by remember { mutableStateOf(false) }
     var statusText by remember { mutableStateOf("Generating presentation") }
-    var generationTime by remember { mutableStateOf<Long?>(null) }
+    var signingTime by remember { mutableStateOf<Long?>(null) }
+    var presentationTime by remember { mutableStateOf<Long?>(null) }
     var verificationTime by remember { mutableStateOf<Long?>(null) }
+
     val scope = rememberCoroutineScope()
 
     fun startPresentation() {
@@ -442,21 +627,31 @@ fun PresentationScreen(
         isProcessing = true
         scope.launch {
             try {
-                val startTimeGen = System.currentTimeMillis()
-                val pres = withContext(Dispatchers.IO) {
-                    // Presentation generation
+                val (pres, signMs, presentMs) = withContext(Dispatchers.IO) {
                     val today = (System.currentTimeMillis() / 1000).toULong()
-                    val nonce = "demo-nonce-${sessionId}".toByteArray() 
-                    
+                    val nonce = "demo-nonce-${sessionId}".toByteArray()
+
                     // Hardware-based signing
                     val startTimeSign = System.currentTimeMillis()
                     val sigBytes = keyManager.sign(nonce)
-                    Log.d("MainActivity", "Signature took ${System.currentTimeMillis() - startTimeSign} ms")
+                    val signMs = System.currentTimeMillis() - startTimeSign
                     val sig = uniffi.agever.holderSigFromDerBytes(sigBytes)
 
-                    uniffi.agever.genPresentation(credential!!, holderPublicKey!!, today, nonce, sig)
+                    val cred = credential!!
+                    val revHandle = cred.revHandle()
+                    // Scanning is disabled from the home screen until the revocation status has
+                    // been fetched at least once, so gapList is always set here.
+                    val bracket = uniffi.agever.findBracket(gapList!!, revHandle)
+                        ?: throw Exception("This credential is no longer valid.")
+
+                    val startTimePresent = System.currentTimeMillis()
+                    val presentation = uniffi.agever.genPresentation(cred, holderPublicKey!!, today, nonce, sig, bracket)
+                    val presentMs = System.currentTimeMillis() - startTimePresent
+
+                    Triple(presentation, signMs, presentMs)
                 }
-                generationTime = System.currentTimeMillis() - startTimeGen
+                signingTime = signMs
+                presentationTime = presentMs
 
                 statusText = "Verifying presentation"
 
@@ -482,7 +677,12 @@ fun PresentationScreen(
                     resultMessage = "The credential was verified successfully."
                 } else {
                     success = false
-                    resultMessage = result.exceptionOrNull()?.message
+                    val serverMessage = result.exceptionOrNull()?.message
+                    resultMessage = if (serverMessage == "invalid token") {
+                        "Your revocation status is out of date. Go back and refresh status, then try again."
+                    } else {
+                        serverMessage
+                    }
                 }
             } catch (e: Exception) {
                 success = false
@@ -560,6 +760,7 @@ fun PresentationScreen(
 
                 Button(
                     modifier = Modifier.fillMaxWidth().height(56.dp),
+                    enabled = gapList != null,
                     onClick = { startPresentation() }
                 ) {
                     Text("Confirm & Share")
@@ -595,13 +796,25 @@ fun PresentationScreen(
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
 
-                if (generationTime != null && verificationTime != null) {
+                if (signingTime != null && presentationTime != null && verificationTime != null) {
                     Spacer(modifier = Modifier.height(16.dp))
-                    Text(
-                        text = "Generation: ${generationTime}ms | Verification: ${verificationTime}ms",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = MaterialTheme.colorScheme.outline
-                    )
+                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                        Text(
+                            text = "Signing: ${signingTime}ms",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.outline
+                        )
+                        Text(
+                            text = "Presentation generation: ${presentationTime}ms",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.outline
+                        )
+                        Text(
+                            text = "Verification (network + server): ${verificationTime}ms",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.outline
+                        )
+                    }
                 }
 
                 Spacer(modifier = Modifier.height(48.dp))
@@ -633,7 +846,13 @@ fun ClaimsList(claimsJson: JSONObject) {
 }
 
 @Composable
-fun StatusRow(label: String, isOk: Boolean, loading: Boolean, subtitle: String? = null) {
+fun StatusRow(
+    label: String,
+    isOk: Boolean,
+    loading: Boolean,
+    subtitle: String? = null,
+    icon: ImageVector = if (isOk) Icons.Default.CheckCircle else Icons.Default.Error
+) {
     Row(
         modifier = Modifier.fillMaxWidth(),
         verticalAlignment = Alignment.CenterVertically,
@@ -656,7 +875,7 @@ fun StatusRow(label: String, isOk: Boolean, loading: Boolean, subtitle: String? 
             )
         } else {
             Icon(
-                imageVector = if (isOk) Icons.Default.CheckCircle else Icons.Default.Error,
+                imageVector = icon,
                 contentDescription = null,
                 tint = if (isOk) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.error
             )
@@ -778,11 +997,20 @@ fun ScannerView(onScanned: (String) -> Unit) {
 fun DemoScreenPreview() {
     WalletTheme {
         DemoScreen(
-            credential = null,
+            credentials = emptyList(),
+            selectedHandle = null,
+            onSelectHandle = {},
             holderPublicKey = null,
             isHardwareBacked = false,
             isFetching = false,
             errorMessage = null,
+            gapList = null,
+            isUpdatingRevocation = false,
+            revocationUpdateTime = null,
+            revocationUpdateError = null,
+            validityByHandle = emptyMap(),
+            onUpdateRevocation = {},
+            onRequestNewCredential = {},
             onNavigateToScanner = {}
         )
     }

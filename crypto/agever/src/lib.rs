@@ -1,11 +1,12 @@
 uniffi::setup_scaffolding!();
 
-use modular_ac::{CommittedDisclosurePresenter, CommittedDisclosureVerifier, Claim, Credential, HolderKeyPair, HolderPublicKey, HolderSecretKey, Scope, Issuer, IssuerKeyPair, IssuerPublicKey, SecP256Fq, SecP256Fr, Params, Presentation, Schema, ecdsa::{self, Signature}};
+use modular_ac::{CommittedDisclosurePresenter, CommittedDisclosureVerifier, Claim, Credential, HolderKeyPair, HolderPublicKey, HolderSecretKey, Scope, Issuer, IssuerKeyPair, IssuerPublicKey, SecP256Fq, SecP256Fr, Params, Presentation, Schema, ecdsa::{self, Signature}, GAP_EPOCH_FIELD, GAP_HI_FIELD, GAP_LO_FIELD, REV_HANDLE_FIELD};
 use ark_ff::{BigInteger, PrimeField};
 
 use ark_std::rand::{self, SeedableRng, rngs::StdRng};
 
 use ark_serialize::{CanonicalSerialize, CanonicalDeserialize};
+use std::sync::Arc;
 
 use sha2::{Sha256, Digest};
 
@@ -24,9 +25,29 @@ impl AgeVerParams {
             (String::from("nbf"), 4..5),
             (String::from("exp"), 5..6),
             (String::from("holder_pk"), 6..14),
+            (String::from(REV_HANDLE_FIELD), 14..15),
         ]);
         let params = Params::new(AGEVER_LABEL.as_bytes(), &schema);
         AgeVerParams(params)
+    }
+}
+
+const REVOCATION_LABEL: &str = "agever-revocation";
+
+/// Parameters for the gap credential schema `{epoch, rid_lo, rid_hi}`, signed by the Status
+/// Manager (not the age-credential issuer).
+#[derive(Clone)]
+pub struct AgeVerRevocationParams(Params);
+
+impl AgeVerRevocationParams {
+    pub fn new() -> Self {
+        let schema = Schema::new(0, vec![
+            (String::from(GAP_EPOCH_FIELD), 0..1),
+            (String::from(GAP_LO_FIELD), 1..2),
+            (String::from(GAP_HI_FIELD), 2..3),
+        ]);
+        let params = Params::new(REVOCATION_LABEL.as_bytes(), &schema);
+        AgeVerRevocationParams(params)
     }
 }
 
@@ -105,12 +126,12 @@ impl AgeVerIssuer {
         AgeVerIssuer { issuer }
     }
 
-    pub fn issue_credential(&self, name: String, age: u64, holder_pk: AgeVerHolderPublicKey) -> Result<AgeVerCredential, AgeVerError> {
+    pub fn issue_credential(&self, name: String, age: u64, holder_pk: AgeVerHolderPublicKey, rev_handle: u64) -> Result<AgeVerCredential, AgeVerError> {
         let mut rng = rand::rngs::StdRng::from_entropy();
 
         // cred is valid right away
         let nbf = chrono::Utc::now().timestamp() as u64 - 60 ; // For demo: avoid clock skew issue with holder by issuing credential with nbf in the past
-        
+
         // and expires in 1 month:
         let exp = (chrono::Utc::now() + chrono::Duration::days(30)).timestamp() as u64;
 
@@ -122,10 +143,92 @@ impl AgeVerIssuer {
             ("nbf".to_string(), Claim::Raw(nbf)),
             ("exp".to_string(), Claim::Raw(exp)),
             ("holder_pk".to_string(), Claim::HolderPk(holder_pk.0.clone())),
+            (REV_HANDLE_FIELD.to_string(), Claim::Raw(rev_handle)),
         ]).map_err(|e| AgeVerError::IssuanceError(e.to_string()))?;
 
         Ok(AgeVerCredential(cred))
     }
+}
+
+#[derive(Clone)]
+pub struct AgeVerStatusManagerKeyPair(IssuerKeyPair);
+
+impl AgeVerStatusManagerKeyPair {
+    pub fn new(rng: &mut StdRng) -> Self {
+        let keypair = IssuerKeyPair::generate_using_rng_and_bbs23_params(rng, &AgeVerRevocationParams::new().0.sig_params);
+        AgeVerStatusManagerKeyPair(keypair)
+    }
+}
+
+pub struct AgeVerStatusManagerPublicKey(IssuerPublicKey);
+
+impl AgeVerStatusManagerPublicKey {
+    pub fn from_keypair(status_manager_kp: AgeVerStatusManagerKeyPair) -> Self {
+        AgeVerStatusManagerPublicKey(status_manager_kp.0.public_key.clone())
+    }
+}
+
+/// Signs gap credentials on behalf of the revocation authority ("Status Manager"). Reuses the
+/// generic `Issuer` machinery over the gap schema - no new issuance code.
+pub struct AgeVerStatusManager {
+    issuer: Issuer,
+}
+
+impl AgeVerStatusManager {
+    pub fn new(params: &AgeVerRevocationParams, status_manager_keypair: AgeVerStatusManagerKeyPair) -> Self {
+        AgeVerStatusManager { issuer: Issuer::new(&params.0, status_manager_keypair.0) }
+    }
+
+    /// Signs one gap credential per consecutive pair of revoked handles.
+    pub fn revoke(&self, epoch: u64, revoked_handles: Vec<u64>) -> Result<Vec<AgeVerGapCredential>, AgeVerError> {
+        let mut sorted = revoked_handles;
+        sorted.sort();
+        sorted.dedup();
+
+        let mut rng = rand::rngs::StdRng::from_entropy();
+        let mut gaps = Vec::new();
+        let mut prev = 0u64;
+        for handle in sorted.into_iter().chain(std::iter::once(u64::MAX)) {
+            let cred = self.issuer.issue_credential(&mut rng, vec![
+                (GAP_EPOCH_FIELD.to_string(), Claim::Raw(epoch)),
+                (GAP_LO_FIELD.to_string(), Claim::Raw(prev)),
+                (GAP_HI_FIELD.to_string(), Claim::Raw(handle)),
+            ]).map_err(|e| AgeVerError::IssuanceError(e.to_string()))?;
+            gaps.push(AgeVerGapCredential(cred));
+            prev = handle;
+        }
+        Ok(gaps)
+    }
+}
+
+#[derive(Clone, uniffi::Object)]
+pub struct AgeVerGapCredential(Credential);
+
+#[uniffi::export]
+impl AgeVerGapCredential {
+    pub fn to_jwt(&self) -> String {
+        self.0.to_jwt()
+    }
+
+    pub fn claims_json_str(&self) -> String {
+        self.0.claims_json_str()
+    }
+}
+
+#[uniffi::export]
+pub fn gap_credential_from_jwt(s: &str) -> Result<AgeVerGapCredential, AgeVerError> {
+    let cred = Credential::from_jwt(s).map_err(|e| AgeVerError::DeserializationError(e.to_string()))?;
+    Ok(AgeVerGapCredential(cred))
+}
+
+/// Holder-side scan: finds the gap (if any) whose hidden bounds strictly bracket `uid`.
+#[uniffi::export]
+pub fn find_bracket(gaps: Vec<Arc<AgeVerGapCredential>>, uid: u64) -> Option<Arc<AgeVerGapCredential>> {
+    gaps.into_iter().find(|gap| {
+        let lo = match gap.0.claims.get(GAP_LO_FIELD) { Some(Claim::Raw(v)) => *v, _ => return false };
+        let hi = match gap.0.claims.get(GAP_HI_FIELD) { Some(Claim::Raw(v)) => *v, _ => return false };
+        lo < uid && uid < hi
+    })
 }
 
 #[derive(Clone, uniffi::Object)]
@@ -133,6 +236,7 @@ pub struct AgeVerCredential (Credential);
 
 pub struct AgeVerPresenter {
     presenter : CommittedDisclosurePresenter,
+    gap_presenter : CommittedDisclosurePresenter,
     holder_pk : AgeVerHolderPublicKey,
     //rng : StdRng
 }
@@ -147,17 +251,21 @@ pub struct AgeVerPresentation {
 
 
 #[uniffi::export]
-pub fn gen_presentation(cred: &AgeVerCredential, holder_pk: &AgeVerHolderPublicKey, today: u64, nonce: &Vec<u8>, holder_sig: &AgeVerSignature) -> Result<AgeVerPresentation, AgeVerError> {
+pub fn gen_presentation(cred: &AgeVerCredential, holder_pk: &AgeVerHolderPublicKey, today: u64, nonce: &Vec<u8>, holder_sig: &AgeVerSignature, gap_cred: &AgeVerGapCredential) -> Result<AgeVerPresentation, AgeVerError> {
     let params = AgeVerParams::new();
-    let presenter = AgeVerPresenter::new(&params, cred.clone(), holder_pk)?;
-    Ok(presenter.present(today, nonce, holder_sig))
+    let revocation_params = AgeVerRevocationParams::new();
+    let presenter = AgeVerPresenter::new(&params, cred.clone(), holder_pk, &revocation_params, gap_cred)?;
+    presenter.present(today, nonce, holder_sig)
 }
 
 impl AgeVerPresenter {
-    pub fn new(params: &AgeVerParams, cred: AgeVerCredential, holder_pk: &AgeVerHolderPublicKey) -> Result<Self, AgeVerError> {
+    /// `gap_cred` should be the gap credential that brackets the holder's own `rev_handle`
+    /// (found via `find_bracket`) - fetching the current gap list and selecting the right one
+    /// is the caller's responsibility (wallet, not covered by this pass).
+    pub fn new(params: &AgeVerParams, cred: AgeVerCredential, holder_pk: &AgeVerHolderPublicKey, revocation_params: &AgeVerRevocationParams, gap_cred: &AgeVerGapCredential) -> Result<Self, AgeVerError> {
 
         let reveal_idx = Scope::from_iter(vec![String::from("above18")]);
-        let commit_idx = Scope::from_iter(vec![String::from("header"), String::from("name"), String::from("above16"), String::from("nbf"), String::from("exp"), String::from("holder_pk")]); // TODO: remove useless committed 
+        let commit_idx = Scope::from_iter(vec![String::from("header"), String::from("name"), String::from("above16"), String::from("nbf"), String::from("exp"), String::from("holder_pk"), String::from(REV_HANDLE_FIELD)]); // TODO: remove useless committed
 
         let mut rng = rand::rngs::StdRng::from_entropy();
         let presenter = CommittedDisclosurePresenter::new(
@@ -169,25 +277,39 @@ impl AgeVerPresenter {
             None
         ).map_err(|e| AgeVerError::PresentationError(e.to_string()))?;
 
-        Ok(AgeVerPresenter { presenter,  holder_pk: holder_pk.clone() })
+        let gap_reveal_idx = Scope::from_iter(vec![String::from(GAP_EPOCH_FIELD)]);
+        let gap_commit_idx = Scope::from_iter(vec![String::from(GAP_LO_FIELD), String::from(GAP_HI_FIELD)]);
+        let gap_presenter = CommittedDisclosurePresenter::new(
+            &mut rng,
+            &revocation_params.0,
+            &gap_cred.0,
+            gap_reveal_idx,
+            gap_commit_idx,
+            None,
+        ).map_err(|e| AgeVerError::PresentationError(e.to_string()))?;
+
+        Ok(AgeVerPresenter { presenter, gap_presenter, holder_pk: holder_pk.clone() })
     }
 
-    pub fn present(self, today: u64, nonce: &Vec<u8>, holder_sig: &AgeVerSignature) -> AgeVerPresentation {
+    pub fn present(self, today: u64, nonce: &Vec<u8>, holder_sig: &AgeVerSignature) -> Result<AgeVerPresentation, AgeVerError> {
         let mut rng = rand::rngs::StdRng::from_entropy();
+
         let presentation = self.presenter.gen_presentation(
             &mut rng,
             today,
             &self.holder_pk.0,
             nonce,
-            &holder_sig.0
+            &holder_sig.0,
+            &self.gap_presenter,
         );
 
-        AgeVerPresentation { presentation, today }
+        Ok(AgeVerPresentation { presentation, today })
     }
 }
 
 pub struct AgeVerVerifier {
     verifier: CommittedDisclosureVerifier,
+    gap_verifier: CommittedDisclosureVerifier,
 }
 
 pub struct AgeVerIssuerPublicKey (IssuerPublicKey);
@@ -200,15 +322,22 @@ impl AgeVerIssuerPublicKey {
 }
 
 impl AgeVerVerifier {
-    pub fn new(params: &AgeVerParams,  issuer_pk : &AgeVerIssuerPublicKey) -> Self {
+    pub fn new(params: &AgeVerParams, issuer_pk: &AgeVerIssuerPublicKey, revocation_params: &AgeVerRevocationParams, status_manager_pk: &AgeVerStatusManagerPublicKey) -> Self {
         let verifier = CommittedDisclosureVerifier::new(
             params.0.clone(),
             issuer_pk.0.clone()
         );
-        AgeVerVerifier { verifier }
+        let gap_verifier = CommittedDisclosureVerifier::new(
+            revocation_params.0.clone(),
+            status_manager_pk.0.clone()
+        );
+        AgeVerVerifier { verifier, gap_verifier }
     }
 
-    pub fn verify(&self, pres: &AgeVerPresentation, nonce: &Vec<u8>) -> bool { // TODO: add context
+    /// `epoch` is the epoch the verifier currently considers current (e.g. tracked by `web`,
+    /// not covered by this pass); a presentation built from a gap credential signed for an
+    /// older epoch is rejected.
+    pub fn verify(&self, pres: &AgeVerPresentation, nonce: &Vec<u8>, epoch: u64) -> bool { // TODO: add context
 
         let claims = vec![
             ("above18".to_string(), Claim::Bool(true)),
@@ -221,7 +350,9 @@ impl AgeVerVerifier {
             pres.today,
             nonce,
             claims,
-            None).is_ok() 
+            None,
+            &self.gap_verifier,
+            epoch).is_ok()
         }
 }
 
@@ -235,6 +366,15 @@ impl AgeVerCredential {
 
     pub fn claims_json_str(&self) -> String {
         self.0.claims_json_str()
+    }
+
+    /// Reads back this credential's own hidden revocation handle (UID), so the holder can look
+    /// up which gap brackets it (see `find_bracket`).
+    pub fn rev_handle(&self) -> Result<u64, AgeVerError> {
+        match self.0.claims.get(REV_HANDLE_FIELD) {
+            Some(Claim::Raw(v)) => Ok(*v),
+            _ => Err(AgeVerError::DeserializationError("rev_handle claim missing or invalid".to_string())),
+        }
     }
 }
 
@@ -450,4 +590,55 @@ pub fn holder_sig_from_der_bytes(bytes: Vec<u8>) -> Result<AgeVerSignature, AgeV
 pub fn verify_holder_sig(nonce: &Vec<u8>, holder_pk: &AgeVerHolderPublicKey, sig: &AgeVerSignature) -> bool {
     let nonce_digest = Sha256::digest(nonce);
     sig.0.verify_prehashed(SecP256Fr::from_be_bytes_mod_order(&nonce_digest), holder_pk.0.clone())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn issue_present_verify_and_revoke() {
+        let mut rng = StdRng::seed_from_u64(0);
+
+        // Age-credential issuer setup
+        let params = AgeVerParams::new();
+        let issuer_keypair = AgeVerIssuerKeyPair::new(&mut rng);
+        let issuer_pk = AgeVerIssuerPublicKey::from_keypair(issuer_keypair.clone());
+        let issuer = AgeVerIssuer::new(&params, issuer_keypair);
+
+        // Status Manager setup (a second, independent signer over the gap schema)
+        let revocation_params = AgeVerRevocationParams::new();
+        let status_manager_keypair = AgeVerStatusManagerKeyPair::new(&mut rng);
+        let status_manager_pk = AgeVerStatusManagerPublicKey::from_keypair(status_manager_keypair.clone());
+        let status_manager = AgeVerStatusManager::new(&revocation_params, status_manager_keypair);
+
+        // Holder key + credential issuance, with a hidden rev_handle
+        let holder_keypair = gen_holder_keypair();
+        let holder_pk = holder_keypair.public_key();
+        let rev_handle = 1500u64;
+        let cred = issuer.issue_credential("Roger".to_string(), 20, holder_pk.clone(), rev_handle).expect("issuance failed");
+        assert_eq!(cred.rev_handle().expect("rev_handle should be readable"), rev_handle);
+
+        // Initial gap list: nobody revoked yet, so a single sentinel gap (0, u64::MAX) covers
+        // every possible handle.
+        let epoch = 1u64;
+        let gaps = status_manager.revoke(epoch, vec![]).expect("revoke (empty) failed");
+        let gaps: Vec<Arc<AgeVerGapCredential>> = gaps.into_iter().map(Arc::new).collect();
+        let bracket = find_bracket(gaps, rev_handle).expect("should find a bracketing gap");
+
+        // Presentation
+        let today = chrono::Utc::now().timestamp() as u64;
+        let nonce = b"test-nonce".to_vec();
+        let holder_sig = gen_holder_sig(&nonce, &holder_keypair.secret_key());
+        let presentation = gen_presentation(&cred, &holder_pk, today, &nonce, &holder_sig, &bracket).expect("presentation generation failed");
+
+        // Verification
+        let verifier = AgeVerVerifier::new(&params, &issuer_pk, &revocation_params, &status_manager_pk);
+        assert!(verifier.verify(&presentation, &nonce, epoch), "presentation should verify");
+
+        // Revocation: the Status Manager bumps the epoch (e.g. after revoking some other
+        // handle) and re-signs the gap list. A verifier now checking against the new epoch
+        // must reject the stale, pre-revocation presentation.
+        assert!(!verifier.verify(&presentation, &nonce, epoch + 1), "presentation should be rejected against an epoch newer than the gap credential's");
+    }
 }

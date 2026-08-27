@@ -45,6 +45,9 @@ use sha2::{Digest, Sha256};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
+mod revocation;
+pub use revocation::{ProofOfNonRevocation, GAP_EPOCH_FIELD, GAP_HI_FIELD, GAP_LO_FIELD, REV_HANDLE_FIELD};
+
 #[derive(Debug, Clone)]
 /// The parameters for the committed disclosure of messages in BBS signatures.
 pub struct Params {
@@ -102,12 +105,14 @@ pub struct ProofOfPossession {
 
 
 #[derive(Clone, CanonicalSerialize, CanonicalDeserialize)]
-/// A presentation of a credential, consisting of a committed disclosure of messages in the credential, 
-/// a proof of validity of the credential, and a proof of possession of the credential by the holder.
+/// A presentation of a credential, consisting of a committed disclosure of messages in the credential,
+/// a proof of validity of the credential, a proof of possession of the credential by the holder,
+/// and a proof that the credential has not been revoked.
 pub struct Presentation {
     pub committed_disclosure: CommittedDisclosure,
     pub validity_proof: ProofOfValidty,
     pub holder_binding_proof: ProofOfPossession,
+    pub non_revocation_proof: ProofOfNonRevocation,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -282,9 +287,6 @@ impl HolderKeyPair {
 /// The CRS for generating the base points of the BBS signature.
 const SIG_LABEL: &[u8] = b"sig label";
 
-/// The CRS for generating the base points of the commitment for the messages in the BBS signature.
-const COMM_LABEL: &[u8] = b"comm label";
-
 const BPP_LABEL: &[u8] = b"bpp label";
 
 const COMM_LABEL_P256: &[u8] = b"comm label p256";
@@ -325,9 +327,12 @@ impl Params {
     pub fn new(label: &[u8], schema: &Schema) -> Self {
         let message_count = schema.len() as u32; // TODO: check schema
         let sig_params = SignatureParams23G1::<Bls12_381>::new::<Sha256>([SIG_LABEL, label].concat().as_slice(), message_count);
-        let comm_key = PedersenCommitmentKey::<G1Affine>::new::<Sha256>([COMM_LABEL, label].concat().as_slice());
 
         let bpp_params = BppSetupParams::<G1Affine>::new_for_perfect_range_proof::<Sha256>(BPP_LABEL, BPP_BASE, BPP_BITSIZE, BPP_NUM_PROOFS);
+        // comm_key shares its (g, h) basis with bpp_params so that Pedersen commitments made 
+        // here are homomorphically compatible with Bulletproofs++ range proofs
+        let (comm_g, comm_h) = bpp_params.get_pedersen_commitment_key();
+        let comm_key = PedersenCommitmentKey::<G1Affine> { g: comm_g, h: comm_h };
 
         let comm_key_p256 = PedersenCommitmentKey::<SecP256Affine>::new::<Sha256>([COMM_LABEL_P256, label].concat().as_slice());
         let comm_key_tom256 = PedersenCommitmentKey::<Tom256Affine>::new::<Sha256>([COMM_LABEL_TOM256, label].concat().as_slice());
@@ -653,11 +658,12 @@ impl CommittedDisclosurePresenter {
         }
     }
 
-    pub fn gen_presentation<R: RngCore>(&self, rng: &mut R, today: u64, holder_pk: &HolderPublicKey, nonce: &Nonce, holder_sig: &ecdsa::Signature) -> Presentation {
+    pub fn gen_presentation<R: RngCore>(&self, rng: &mut R, today: u64, holder_pk: &HolderPublicKey, nonce: &Nonce, holder_sig: &ecdsa::Signature, gap_presenter: &CommittedDisclosurePresenter) -> Presentation {
         let committed_disclosure = self.gen_base_proof(rng);
         let validity_proof = self.gen_validity_proof(rng, today);
         let holder_binding_proof = self.gen_holder_binding_proof(rng, holder_sig, holder_pk, nonce);
-        Presentation { committed_disclosure, validity_proof, holder_binding_proof }
+        let non_revocation_proof = self.gen_non_revocation_proof(rng, gap_presenter);
+        Presentation { committed_disclosure, validity_proof, holder_binding_proof, non_revocation_proof }
     }
 
 
@@ -778,10 +784,11 @@ impl CommittedDisclosureVerifier {
             .map_err(|e| Error::VerificationFailed(format!("signature proof verification failed: {:?}", e)))
     }
 
-    pub fn verify_presentation<R: RngCore>(&self, rng: &mut R, pres: &Presentation, today: u64, nonce: &Nonce, claims: Vec<(String, Claim)>, ctx : Option<Vec<u8>>) -> Result<(), Error> {
+    pub fn verify_presentation<R: RngCore>(&self, rng: &mut R, pres: &Presentation, today: u64, nonce: &Nonce, claims: Vec<(String, Claim)>, ctx : Option<Vec<u8>>, gap_verifier: &CommittedDisclosureVerifier, epoch: u64) -> Result<(), Error> {
         self.verify(rng, &pres.committed_disclosure, &claims, ctx)?;
         self.verify_validity_proof(rng, &pres.validity_proof, &pres.committed_disclosure.commitments, today)?;
         self.verify_holder_binding_proof(rng, &pres.committed_disclosure.commitments.clone(), nonce, &pres.holder_binding_proof)?;
+        self.verify_non_revocation_proof(rng, &pres.committed_disclosure.commitments, gap_verifier, epoch, &pres.non_revocation_proof)?;
         Ok(())
     }
 }
@@ -988,12 +995,13 @@ mod tests {
             (String::from("nbf"), 4..5),
             (String::from("exp"), 5..6),
             (String::from("holder_pk"), 6..14),
+            (String::from(REV_HANDLE_FIELD), 14..15),
         ];
         let schema = Schema::new(0, schema_fields);
 
         let mut rng = StdRng::seed_from_u64(0);
         let reveal_idx: Scope = Scope::from_iter(vec![String::from("above16"), String::from("above18")]);
-        let commit_idx: Scope = Scope::from_iter(vec![String::from("header"), String::from("name"), String::from("nbf"), String::from("exp"), String::from("holder_pk")]); 
+        let commit_idx: Scope = Scope::from_iter(vec![String::from("header"), String::from("name"), String::from("nbf"), String::from("exp"), String::from("holder_pk"), String::from(REV_HANDLE_FIELD)]);
 
         //// SETUP
         let params = Params::new(b"test", &schema);
@@ -1014,6 +1022,7 @@ mod tests {
 
         let name = "Roger".to_string();
         let age = 20;
+        let rev_handle_value = 1500u64;
 
         let claims = vec![
             ("header".to_string(), Claim::Value("<unused>".to_string())),
@@ -1023,6 +1032,7 @@ mod tests {
             ("nbf".to_string(), Claim::Raw(nbf)),
             ("exp".to_string(), Claim::Raw(exp)),
             ("holder_pk".to_string(), Claim::HolderPk(ecdsa_keypair.pk)),
+            (REV_HANDLE_FIELD.to_string(), Claim::Raw(rev_handle_value)),
         ];
 
         let revealed_claims : Vec<(String, Claim)> = claims.clone().into_iter().filter(|(id, _)| reveal_idx.contains(id)).collect();
@@ -1031,6 +1041,38 @@ mod tests {
         //// ISSUANCE
         let issuer = Issuer::new(&params, issuer_keypair.clone());
         let cred = issuer.issue_credential(&mut rng, claims).expect("credential issuance failed");
+
+        //// GAP (REVOCATION) CREDENTIAL SETUP
+        // A second, independent credential type signed by a "Status Manager" key, over its own
+        // schema. 
+        let gap_schema_fields: Vec<(String, Range<usize>)> = vec![
+            (GAP_EPOCH_FIELD.to_string(), 0..1),
+            (GAP_LO_FIELD.to_string(), 1..2),
+            (GAP_HI_FIELD.to_string(), 2..3),
+        ];
+        let gap_schema = Schema::new(0, gap_schema_fields);
+        let gap_params = Params::new(b"test-revocation", &gap_schema);
+        let status_manager_keypair = KeypairG2::<Bls12_381>::generate_using_rng_and_bbs23_params(&mut rng, &gap_params.sig_params);
+        let gap_issuer = Issuer::new(&gap_params, status_manager_keypair.clone());
+
+        let epoch = 1u64;
+        let gap_claims = vec![
+            (GAP_EPOCH_FIELD.to_string(), Claim::Raw(epoch)),
+            (GAP_LO_FIELD.to_string(), Claim::Raw(1000)),
+            (GAP_HI_FIELD.to_string(), Claim::Raw(2000)),
+        ];
+        let gap_cred = gap_issuer.issue_credential(&mut rng, gap_claims).expect("gap credential issuance failed");
+
+        let gap_reveal_idx: Scope = Scope::from_iter(vec![GAP_EPOCH_FIELD.to_string()]);
+        let gap_commit_idx: Scope = Scope::from_iter(vec![GAP_LO_FIELD.to_string(), GAP_HI_FIELD.to_string()]);
+        let gap_presenter = CommittedDisclosurePresenter::new(
+            &mut rng,
+            &gap_params,
+            &gap_cred,
+            gap_reveal_idx.clone(),
+            gap_commit_idx.clone(),
+            None,
+        ).expect("gap committed disclosure failed");
 
 
         println!("Credential JWT: {}", cred.to_jwt());
@@ -1075,13 +1117,17 @@ mod tests {
         );
         end_timer!(start_holder_binding);
 
+        let start_non_revocation = start_timer!(|| "non-revocation proof generation");
+        let non_revocation_proof = presenter.gen_non_revocation_proof(&mut rng, &gap_presenter);
+        end_timer!(start_non_revocation);
+
         // TRANSMISSION
-        let pres = Presentation { committed_disclosure: pres_base.clone(), validity_proof: pres_validity.clone(), holder_binding_proof: holder_binding_proof.clone() };
+        let pres = Presentation { committed_disclosure: pres_base.clone(), validity_proof: pres_validity.clone(), holder_binding_proof: holder_binding_proof.clone(), non_revocation_proof: non_revocation_proof.clone() };
         let mut temp_buf = vec![0u8; pres.serialized_size(ark_serialize::Compress::Yes)];
         pres.serialize_compressed(&mut temp_buf[..]).unwrap();
         let pres_r = Presentation::deserialize_compressed(&temp_buf[..]).unwrap();
-        let Presentation { committed_disclosure: pres_base_r, validity_proof: pres_validity_r, holder_binding_proof: holder_binding_proof_r } = pres_r;
-        
+        let Presentation { committed_disclosure: pres_base_r, validity_proof: pres_validity_r, holder_binding_proof: holder_binding_proof_r, non_revocation_proof: non_revocation_proof_r } = pres_r;
+
         // VERIFICATION
         let start_verification = start_timer!(|| "total proof verification");
         let verifier = CommittedDisclosureVerifier::new(
@@ -1099,13 +1145,25 @@ mod tests {
         let start_holder_binding_verification = start_timer!(|| "holder binding proof verification");
         verifier.verify_holder_binding_proof(&mut rng, &pres_base_r.commitments, &nonce, &holder_binding_proof_r).expect("verification of holder binding proof failed");
         end_timer!(start_holder_binding_verification);
+
+        let gap_verifier = CommittedDisclosureVerifier::new(gap_params.clone(), status_manager_keypair.public_key.clone());
+        let start_non_revocation_verification = start_timer!(|| "non-revocation proof verification");
+        verifier.verify_non_revocation_proof(&mut rng, &pres_base_r.commitments, &gap_verifier, epoch, &non_revocation_proof_r).expect("verification of non-revocation proof failed");
+        end_timer!(start_non_revocation_verification);
         end_timer!(start_verification);
 
+        // REVOCATION: the Status Manager bumps the epoch (e.g. after revoking some other
+        // handle) and re-signs the gap list. A verifier now checking against the new epoch
+        // must reject a presentation built from the stale, pre-revocation gap credential, even
+        // though the underlying BPP bracket proof is still valid.
+        let stale_epoch_result = verifier.verify_non_revocation_proof(&mut rng, &pres_base_r.commitments, &gap_verifier, epoch + 1, &non_revocation_proof_r);
+        assert!(stale_epoch_result.is_err(), "verification should fail against an epoch newer than the one the gap credential was signed for");
 
         // SIZES
         println!("Base proof size: {} bytes", pres_base.serialized_size(ark_serialize::Compress::Yes));
         println!("Validity proof size: {} bytes", pres_validity.serialized_size(ark_serialize::Compress::Yes));
         println!("Holder binding proof size: {} bytes", holder_binding_proof.sig_proof.serialized_size(ark_serialize::Compress::Yes));
+        println!("Non-revocation proof size: {} bytes", non_revocation_proof.serialized_size(ark_serialize::Compress::Yes));
         println!("Full Presentation size: {} bytes", pres.serialized_size(ark_serialize::Compress::Yes));
 
     }
