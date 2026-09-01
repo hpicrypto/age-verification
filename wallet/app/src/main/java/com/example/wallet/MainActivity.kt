@@ -1,5 +1,6 @@
 package com.example.wallet
 
+import android.content.Context
 import android.content.Intent
 import android.os.Bundle
 import android.util.Log
@@ -13,6 +14,8 @@ import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.background
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -27,6 +30,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Cancel
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Error
 import androidx.compose.material.icons.filled.Key
 import androidx.compose.material.icons.filled.QrCodeScanner
@@ -38,6 +42,7 @@ import androidx.compose.material3.CenterAlignedTopAppBar
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ElevatedCard
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
@@ -96,6 +101,40 @@ sealed class AppScreen(val order: Int) {
     data class Presentation(val sessionId: String, val isDeepLink: Boolean = false) : AppScreen(2)
 }
 
+private const val CREDENTIALS_PREFS = "wallet_credentials"
+private const val CREDENTIALS_KEY = "credentials_jwt"
+
+private fun loadStoredCredentials(context: Context): List<AgeVerCredential> {
+    val storedCredentials = context
+        .getSharedPreferences(CREDENTIALS_PREFS, Context.MODE_PRIVATE)
+        .getString(CREDENTIALS_KEY, null)
+        ?: return emptyList()
+
+    return try {
+        val credentialsJson = JSONArray(storedCredentials)
+        (0 until credentialsJson.length()).mapNotNull { index ->
+            try {
+                uniffi.agever.credentialFromJwt(credentialsJson.getString(index))
+            } catch (_: Exception) {
+                null
+            }
+        }
+    } catch (_: Exception) {
+        emptyList()
+    }
+}
+
+private fun saveCredentials(context: Context, credentials: List<AgeVerCredential>) {
+    val credentialsJson = JSONArray().apply {
+        credentials.forEach { put(it.toJwt()) }
+    }
+    context
+        .getSharedPreferences(CREDENTIALS_PREFS, Context.MODE_PRIVATE)
+        .edit()
+        .putString(CREDENTIALS_KEY, credentialsJson.toString())
+        .apply()
+}
+
 class MainActivity : ComponentActivity() {
     private var deepLinkSessionId = mutableStateOf<String?>(null)
 
@@ -133,8 +172,10 @@ class MainActivity : ComponentActivity() {
                 }
             }
 
-            var credentials by remember { mutableStateOf<List<AgeVerCredential>>(emptyList()) }
-            var selectedHandle by remember { mutableStateOf<ULong?>(null) }
+            val context = androidx.compose.ui.platform.LocalContext.current
+            val storedCredentials = remember(context) { loadStoredCredentials(context) }
+            var credentials by remember { mutableStateOf(storedCredentials) }
+            var selectedHandle by remember { mutableStateOf(storedCredentials.firstOrNull()?.revHandle()) }
             var holderPublicKey by remember { mutableStateOf<AgeVerHolderPublicKey?>(null) }
             var isHardwareBacked by remember { mutableStateOf(false) }
             var isFetching by remember { mutableStateOf(false) }
@@ -149,7 +190,6 @@ class MainActivity : ComponentActivity() {
             var validityByHandle by remember { mutableStateOf<Map<ULong, Boolean>>(emptyMap()) }
             val scope = rememberCoroutineScope()
 
-            val context = androidx.compose.ui.platform.LocalContext.current
             val keyManager = remember { HardwareKeyManager(context) }
 
             val cameraPermissionState = rememberPermissionState(android.Manifest.permission.CAMERA)
@@ -222,7 +262,9 @@ class MainActivity : ComponentActivity() {
                             }
                         }
                         val newCredential = uniffi.agever.credentialFromJwt(result.orEmpty())
-                        credentials = credentials + newCredential
+                        val updatedCredentials = credentials + newCredential
+                        credentials = updatedCredentials
+                        saveCredentials(context, updatedCredentials)
                         selectedHandle = newCredential.revHandle()
                     } catch (e: Exception) {
                         errorMessage = e.message
@@ -251,7 +293,11 @@ class MainActivity : ComponentActivity() {
                     errorMessage = "Key error: ${e.message}"
                 }
 
-                requestNewCredential()
+                if (credentials.isEmpty()) {
+                    requestNewCredential()
+                } else {
+                    selectedHandle = credentials.first().revHandle()
+                }
             }
 
             WalletTheme {
@@ -302,6 +348,12 @@ class MainActivity : ComponentActivity() {
                                     validityByHandle = validityByHandle,
                                     onUpdateRevocation = { updateRevocationStatus() },
                                     onRequestNewCredential = { requestNewCredential() },
+                                    onClearCredentials = {
+                                        credentials = emptyList()
+                                        selectedHandle = null
+                                        validityByHandle = emptyMap()
+                                        saveCredentials(context, emptyList())
+                                    },
                                     onNavigateToScanner = {
                                         errorMessage = null
                                         currentScreen = AppScreen.Scanner
@@ -320,7 +372,9 @@ class MainActivity : ComponentActivity() {
                         is AppScreen.Presentation -> {
                             PresentationScreen(
                                 sessionId = screen.sessionId,
-                                credential = credentials.find { it.revHandle() == selectedHandle },
+                                credentials = credentials,
+                                selectedHandle = selectedHandle,
+                                onSelectHandle = { selectedHandle = it },
                                 gapList = gapList,
                                 holderPublicKey = holderPublicKey,
                                 keyManager = keyManager,
@@ -364,10 +418,12 @@ fun DemoScreen(
     validityByHandle: Map<ULong, Boolean>,
     onUpdateRevocation: () -> Unit,
     onRequestNewCredential: () -> Unit,
+    onClearCredentials: () -> Unit,
     onNavigateToScanner: () -> Unit
 ) {
     val selectedCredential = credentials.find { it.revHandle() == selectedHandle }
     val selectedValid = selectedHandle?.let { validityByHandle[it] }
+    var showClearConfirmation by remember { mutableStateOf(false) }
 
     Column(
         modifier = modifier
@@ -476,6 +532,24 @@ fun DemoScreen(
             Text(if (credentials.isEmpty()) "Request Credential" else "Request New Credential")
         }
 
+        if (credentials.isNotEmpty()) {
+            Spacer(modifier = Modifier.height(8.dp))
+
+            Button(
+                modifier = Modifier.fillMaxWidth(),
+                onClick = { showClearConfirmation = true },
+                enabled = !isFetching,
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = MaterialTheme.colorScheme.error,
+                    contentColor = MaterialTheme.colorScheme.onError
+                )
+            ) {
+                Icon(Icons.Default.Delete, contentDescription = "Clear credentials")
+                Spacer(modifier = Modifier.size(8.dp))
+                Text("Clear All Credentials")
+            }
+        }
+
         Spacer(modifier = Modifier.height(16.dp))
 
         Button(
@@ -498,6 +572,32 @@ fun DemoScreen(
             Icon(Icons.Default.QrCodeScanner, contentDescription = null)
             Spacer(modifier = Modifier.size(8.dp))
             Text("Verify Credential")
+        }
+
+        if (showClearConfirmation) {
+            AlertDialog(
+                onDismissRequest = { showClearConfirmation = false },
+                title = { Text("Clear all credentials?") },
+                text = { Text("This will permanently remove all stored credentials from this device.") },
+                confirmButton = {
+                    TextButton(
+                        onClick = {
+                            showClearConfirmation = false
+                            onClearCredentials()
+                        },
+                        colors = ButtonDefaults.textButtonColors(
+                            contentColor = MaterialTheme.colorScheme.error
+                        )
+                    ) {
+                        Text("Clear All")
+                    }
+                },
+                dismissButton = {
+                    TextButton(onClick = { showClearConfirmation = false }) {
+                        Text("Cancel")
+                    }
+                }
+            )
         }
 
         if (errorMessage != null) {
@@ -612,7 +712,9 @@ fun ScannerScreen(
 @Composable
 fun PresentationScreen(
     sessionId: String,
-    credential: AgeVerCredential?,
+    credentials: List<AgeVerCredential>,
+    selectedHandle: ULong?,
+    onSelectHandle: (ULong) -> Unit,
     gapList: List<AgeVerGapCredential>?,
     holderPublicKey: AgeVerHolderPublicKey?,
     keyManager: HardwareKeyManager,
@@ -630,8 +732,11 @@ fun PresentationScreen(
     var signingTime by remember { mutableStateOf<Long?>(null) }
     var presentationTime by remember { mutableStateOf<Long?>(null) }
     var verificationTime by remember { mutableStateOf<Long?>(null) }
+    var revealedFields by remember { mutableStateOf<Set<String>>(emptySet()) }
+    var showRevocationData by remember { mutableStateOf(false) }
 
     val scope = rememberCoroutineScope()
+    val credential = credentials.find { it.revHandle() == selectedHandle }
     val selectedValid = credential?.revHandle()?.let { revHandle ->
         gapList?.let { gaps -> uniffi.agever.findBracket(gaps, revHandle) != null }
     }
@@ -721,11 +826,34 @@ fun PresentationScreen(
             modifier = Modifier
                 .padding(innerPadding)
                 .fillMaxSize()
-                .padding(24.dp),
+                .padding(24.dp)
+                .verticalScroll(rememberScrollState()),
             horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.Center
+            verticalArrangement = Arrangement.Top
         ) {
             if (!isConfirmed) {
+                if (credentials.isNotEmpty()) {
+                    Text(
+                        text = "Credential",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.outline
+                    )
+                    Spacer(modifier = Modifier.height(8.dp))
+                    LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        items(credentials, key = { it.revHandle().toString() }) { cred ->
+                            CredentialChip(
+                                credential = cred,
+                                isSelected = cred.revHandle() == selectedHandle,
+                                isValid = gapList?.let { gaps ->
+                                    uniffi.agever.findBracket(gaps, cred.revHandle()) != null
+                                },
+                                onClick = { onSelectHandle(cred.revHandle()) }
+                            )
+                        }
+                    }
+                    Spacer(modifier = Modifier.height(24.dp))
+                }
+
                 Text(
                     text = "Present Credential?",
                     style = MaterialTheme.typography.headlineSmall,
@@ -745,16 +873,28 @@ fun PresentationScreen(
                         val modified = JSONObject()
                         val now = SimpleDateFormat("MMM dd, yyyy hh:mm", Locale.getDefault()).format(Date())
 
-                        modified.put("name", JSONObject().put("type", "string").put("val", "<hidden>"))
+                        modified.put("name", JSONObject()
+                            .put("type", "string")
+                            .put("display", "<hidden>")
+                            .put("actual", original.optJSONObject("name")?.optString("val", "N/A") ?: "N/A"))
                         
                         // Show above16 as true (revealed)
                         if (original.has("above16")) {
                             modified.put("above16", original.getJSONObject("above16"))
                         }
                         
-                        modified.put("above18", JSONObject().put("type", "string").put("val", "<hidden>"))
-                        modified.put("nbf", JSONObject().put("type", "string").put("val", "earlier than $now"))
-                        modified.put("exp", JSONObject().put("type", "string").put("val", "later than $now"))
+                        modified.put("above18", JSONObject()
+                            .put("type", "string")
+                            .put("display", "<hidden>")
+                            .put("actual", original.optJSONObject("above18")?.optString("val", "N/A") ?: "N/A"))
+                        modified.put("nbf", JSONObject()
+                            .put("type", "string")
+                            .put("display", "earlier than $now")
+                            .put("actual", original.optJSONObject("nbf")?.optString("val", "N/A") ?: "N/A"))
+                        modified.put("exp", JSONObject()
+                            .put("type", "string")
+                            .put("display", "later than $now")
+                            .put("actual", original.optJSONObject("exp")?.optString("val", "N/A") ?: "N/A"))
                         modified
                     } catch (e: Exception) {
                         JSONObject()
@@ -766,7 +906,98 @@ fun PresentationScreen(
                     elevation = CardDefaults.elevatedCardElevation(defaultElevation = 4.dp)
                 ) {
                     Column(modifier = Modifier.padding(16.dp)) {
-                        ClaimsList(displayClaims)
+                        RevealableClaimsList(displayClaims, revealedFields) { field ->
+                            revealedFields = if (revealedFields.contains(field)) {
+                                revealedFields - field
+                            } else {
+                                revealedFields + field
+                            }
+                        }
+                    }
+                }
+
+                if (gapList != null && gapList!!.isNotEmpty() && credential != null) {
+                    Spacer(modifier = Modifier.height(24.dp))
+                    
+                    val bracket = uniffi.agever.findBracket(gapList!!, credential!!.revHandle())
+                    
+                    if (bracket != null) {
+                        ElevatedCard(
+                            modifier = Modifier.fillMaxWidth(),
+                            elevation = CardDefaults.elevatedCardElevation(defaultElevation = 4.dp)
+                        ) {
+                            Column(modifier = Modifier.padding(16.dp)) {
+                                Text(
+                                    text = "Revocation Data Shared",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.outline
+                                )
+                                Spacer(modifier = Modifier.height(8.dp))
+                                
+                                val claimsJson = remember(bracket) {
+                                    try { JSONObject(bracket.claimsJsonStr()) } catch (e: Exception) { null }
+                                }
+                                
+                                val formattedClaimsStr = remember(claimsJson) {
+                                    claimsJson?.let {
+                                        try {
+                                            // Format JSON with proper handling of u64 string values
+                                            val formatted = StringBuilder()
+                                            val keysIterator = it.keys()
+                                            val keysList = keysIterator.asSequence().toList()
+                                            
+                                            keysList.forEachIndexed { index, key ->
+                                                val obj = it.getJSONObject(key)
+                                                val type = obj.optString("type")
+                                                val val_str = obj.optString("val")
+                                                
+                                                formatted.append("\"").append(key).append("\": ")
+                                                if (type == "raw") {
+                                                    // Display u64 string values as plain integers
+                                                    formatted.append(val_str)
+                                                } else {
+                                                    formatted.append("\"").append(val_str).append("\"")
+                                                }
+                                                if (index < keysList.size - 1) {
+                                                    formatted.append(", ")
+                                                }
+                                            }
+                                            "{ " + formatted.toString() + " }"
+                                        } catch (e: Exception) {
+                                            it.toString()
+                                        }
+                                    } ?: "N/A"
+                                }
+                                
+                                claimsJson?.let { claims ->
+                                    Text(
+                                        text = "Tap to ${if (showRevocationData) "hide" else "reveal"} revocation epoch & commitment",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = MaterialTheme.colorScheme.outline,
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .clickable { showRevocationData = !showRevocationData }
+                                            .padding(8.dp)
+                                    )
+                                    
+                                    if (showRevocationData) {
+                                        Text(
+                                            text = formattedClaimsStr,
+                                            style = MaterialTheme.typography.labelSmall.copy(
+                                                fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace,
+                                                fontSize = androidx.compose.material3.MaterialTheme.typography.labelSmall.fontSize * 0.85f
+                                            ),
+                                            color = MaterialTheme.colorScheme.outline,
+                                            modifier = Modifier
+                                                .fillMaxWidth()
+                                                .padding(8.dp)
+                                                .background(MaterialTheme.colorScheme.surfaceVariant, shape = RoundedCornerShape(4.dp))
+                                                .padding(8.dp)
+                                        )
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
 
@@ -888,6 +1119,76 @@ fun ClaimsList(claimsJson: JSONObject) {
 }
 
 @Composable
+fun RevealableClaimsList(
+    claimsJson: JSONObject,
+    revealedFields: Set<String>,
+    onToggleReveal: (String) -> Unit
+) {
+    val displayKeys = listOf(
+        "name" to "Name",
+        "above16" to "Above 16",
+        "above18" to "Above 18",
+        "nbf" to "Valid From",
+        "exp" to "Expires At"
+    )
+    displayKeys.forEach { (key, label) ->
+        claimsJson.optJSONObject(key)?.let { valueObj ->
+            val isRevealed = revealedFields.contains(key)
+            val displayValue = if (isRevealed) {
+                valueObj.optString("actual", valueObj.optString("val", "N/A"))
+            } else {
+                valueObj.optString("display", valueObj.optString("val", "<hidden>"))
+            }
+            
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clickable { onToggleReveal(key) }
+                    .padding(vertical = 8.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = label,
+                    style = MaterialTheme.typography.bodyMedium,
+                    modifier = Modifier.weight(1f)
+                )
+                Text(
+                    text = displayValue,
+                    style = if (isRevealed) {
+                        MaterialTheme.typography.bodySmall.copy(
+                            fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace,
+                            fontWeight = FontWeight.Bold
+                        )
+                    } else {
+                        MaterialTheme.typography.bodySmall
+                    },
+                    color = if (isRevealed) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier
+                        .padding(start = 12.dp)
+                        .weight(1.5f)
+                )
+            }
+            Divider(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(vertical = 4.dp),
+                color = MaterialTheme.colorScheme.outlineVariant
+            )
+        }
+    }
+}
+
+@Composable
+fun Divider(modifier: Modifier = Modifier, color: Color = Color.Gray) {
+    Box(
+        modifier = modifier
+            .height(1.dp)
+            .background(color)
+    )
+}
+
+@Composable
 fun StatusRow(
     label: String,
     isOk: Boolean,
@@ -987,6 +1288,9 @@ fun ClaimRow(label: String, valueObj: JSONObject) {
 fun ScannerView(onScanned: (String) -> Unit) {
     val context = androidx.compose.ui.platform.LocalContext.current
     val lifecycleOwner = androidx.lifecycle.compose.LocalLifecycleOwner.current
+    var lastScannedValue by remember { mutableStateOf<String?>(null) }
+    var lastScanTime by remember { mutableStateOf(0L) }
+    val SCAN_DEBOUNCE_MS = 500L
 
     val cameraController = remember {
         LifecycleCameraController(context).apply {
@@ -1005,7 +1309,12 @@ fun ScannerView(onScanned: (String) -> Unit) {
                     val barcodes = result.getValue(barcodeScanner)
                     if (!barcodes.isNullOrEmpty()) {
                         barcodes.firstOrNull()?.rawValue?.let {
-                            onScanned(it)
+                            val currentTime = System.currentTimeMillis()
+                            if (it != lastScannedValue && (currentTime - lastScanTime) > SCAN_DEBOUNCE_MS) {
+                                lastScannedValue = it
+                                lastScanTime = currentTime
+                                onScanned(it)
+                            }
                         }
                     }
                 }
@@ -1053,6 +1362,7 @@ fun DemoScreenPreview() {
             validityByHandle = emptyMap(),
             onUpdateRevocation = {},
             onRequestNewCredential = {},
+            onClearCredentials = {},
             onNavigateToScanner = {}
         )
     }
