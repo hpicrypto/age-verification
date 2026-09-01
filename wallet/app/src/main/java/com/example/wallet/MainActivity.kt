@@ -6,6 +6,7 @@ import android.os.Bundle
 import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.activity.compose.BackHandler
 import androidx.activity.enableEdgeToEdge
 import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
 import androidx.compose.animation.*
@@ -14,18 +15,23 @@ import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.ScrollState
 import androidx.compose.foundation.background
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.offset
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Cancel
 import androidx.compose.material.icons.filled.CheckCircle
@@ -34,6 +40,8 @@ import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Error
 import androidx.compose.material.icons.filled.Key
 import androidx.compose.material.icons.filled.QrCodeScanner
+import androidx.compose.material.icons.filled.ArrowBack
+import androidx.compose.material.icons.filled.Settings
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -44,8 +52,10 @@ import androidx.compose.material3.ElevatedCard
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBarDefaults
@@ -58,9 +68,12 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
@@ -84,6 +97,8 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.concurrent.TimeUnit
+import kotlin.math.max
+import kotlin.math.roundToInt
 import okhttp3.FormBody
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
@@ -99,10 +114,45 @@ sealed class AppScreen(val order: Int) {
     object Home : AppScreen(0)
     object Scanner : AppScreen(1)
     data class Presentation(val sessionId: String, val isDeepLink: Boolean = false) : AppScreen(2)
+    object Settings : AppScreen(3)
 }
 
 private const val CREDENTIALS_PREFS = "wallet_credentials"
 private const val CREDENTIALS_KEY = "credentials_jwt"
+private const val RELOAD_STATUS_ON_OPEN_KEY = "reload_status_on_open"
+private const val RELOAD_STATUS_ON_REDIRECT_KEY = "reload_status_on_redirect"
+
+@Composable
+private fun ScrollIndicator(scrollState: ScrollState, modifier: Modifier = Modifier) {
+    if (scrollState.maxValue == 0 || scrollState.viewportSize == 0) return
+
+    BoxWithConstraints(
+        modifier = modifier
+            .width(3.dp)
+            .fillMaxHeight()
+            .padding(vertical = 2.dp)
+            .clip(RoundedCornerShape(2.dp))
+            .background(MaterialTheme.colorScheme.surfaceVariant)
+    ) {
+        val trackHeight = constraints.maxHeight
+        val contentHeight = scrollState.viewportSize + scrollState.maxValue
+        val thumbHeight = max(
+            with(LocalDensity.current) { 12.dp.toPx().roundToInt() },
+            (trackHeight * scrollState.viewportSize / contentHeight)
+        )
+            .coerceAtMost(trackHeight)
+        val thumbOffset = ((trackHeight - thumbHeight) * scrollState.value / scrollState.maxValue)
+
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(with(LocalDensity.current) { thumbHeight.toDp() })
+                .offset { IntOffset(0, thumbOffset) }
+                .clip(RoundedCornerShape(2.dp))
+                .background(MaterialTheme.colorScheme.outline)
+        )
+    }
+}
 
 private fun loadStoredCredentials(context: Context): List<AgeVerCredential> {
     val storedCredentials = context
@@ -165,14 +215,10 @@ class MainActivity : ComponentActivity() {
             var currentScreen by remember { mutableStateOf<AppScreen>(AppScreen.Home) }
 
             val dlSessionId by deepLinkSessionId
-            LaunchedEffect(dlSessionId) {
-                dlSessionId?.let {
-                    currentScreen = AppScreen.Presentation(it, isDeepLink = true)
-                    deepLinkSessionId.value = null
-                }
-            }
-
             val context = androidx.compose.ui.platform.LocalContext.current
+            val preferences = remember(context) {
+                context.getSharedPreferences(CREDENTIALS_PREFS, Context.MODE_PRIVATE)
+            }
             val storedCredentials = remember(context) { loadStoredCredentials(context) }
             var credentials by remember { mutableStateOf(storedCredentials) }
             var selectedHandle by remember { mutableStateOf(storedCredentials.firstOrNull()?.revHandle()) }
@@ -188,6 +234,12 @@ class MainActivity : ComponentActivity() {
             // Only entries for credentials that have actually been checked against a fetched
             // gap list are present here - absence (not false) means "not checked yet".
             var validityByHandle by remember { mutableStateOf<Map<ULong, Boolean>>(emptyMap()) }
+            var reloadStatusOnOpen by remember {
+                mutableStateOf(preferences.getBoolean(RELOAD_STATUS_ON_OPEN_KEY, false))
+            }
+            var reloadStatusOnRedirect by remember {
+                mutableStateOf(preferences.getBoolean(RELOAD_STATUS_ON_REDIRECT_KEY, false))
+            }
             val scope = rememberCoroutineScope()
 
             val keyManager = remember { HardwareKeyManager(context) }
@@ -201,9 +253,10 @@ class MainActivity : ComponentActivity() {
                     .build()
             }
 
-            val url1 = "http://127.0.0.1/issue"
-            val url2 = "http://127.0.0.1/validate"
-            val url3 = "http://127.0.0.1/revocation-status"
+            val urlbase = "http://127.0.0.1"
+            val url1 = urlbase + "/issue"
+            val url2 = urlbase + "/validate"
+            val url3 = urlbase + "/revocation-status"
 
             fun updateRevocationStatus() {
                 isUpdatingRevocation = true
@@ -235,6 +288,16 @@ class MainActivity : ComponentActivity() {
                     } finally {
                         isUpdatingRevocation = false
                     }
+                }
+            }
+
+            LaunchedEffect(dlSessionId) {
+                dlSessionId?.let { sessionId ->
+                    if (reloadStatusOnRedirect) {
+                        updateRevocationStatus()
+                    }
+                    currentScreen = AppScreen.Presentation(sessionId, isDeepLink = true)
+                    deepLinkSessionId.value = null
                 }
             }
 
@@ -284,6 +347,31 @@ class MainActivity : ComponentActivity() {
                 isHardwareBacked = keyManager.isKeyHardwareBacked()
             }
 
+            fun clearCredentials() {
+                credentials = emptyList()
+                selectedHandle = null
+                gapList = null
+                validityByHandle = emptyMap()
+                saveCredentials(context, emptyList())
+            }
+
+            fun resetUserKey() {
+                keyManager.deleteKey()
+                try {
+                    refreshHolderKey()
+                } catch (e: Exception) {
+                    errorMessage = "Key error: ${e.message}"
+                }
+            }
+
+            fun clearAllData() {
+                clearCredentials()
+                preferences.edit().clear().apply()
+                reloadStatusOnOpen = false
+                reloadStatusOnRedirect = false
+                resetUserKey()
+            }
+
             LaunchedEffect(Unit) {
                 if (!cameraPermissionState.status.isGranted) {
                     cameraPermissionState.launchPermissionRequest()
@@ -299,6 +387,9 @@ class MainActivity : ComponentActivity() {
                     requestNewCredential()
                 } else {
                     selectedHandle = credentials.first().revHandle()
+                    if (reloadStatusOnOpen) {
+                        updateRevocationStatus()
+                    }
                 }
             }
 
@@ -324,7 +415,7 @@ class MainActivity : ComponentActivity() {
                                 modifier = Modifier.fillMaxSize(),
                                 topBar = {
                                     CenterAlignedTopAppBar(
-                                        title = { Text("AgeVer Demo") },
+                                        title = { Text("Age Verification Demo") },
                                         colors = TopAppBarDefaults.centerAlignedTopAppBarColors(
                                             containerColor = MaterialTheme.colorScheme.primaryContainer,
                                             titleContentColor = MaterialTheme.colorScheme.onPrimaryContainer,
@@ -350,20 +441,7 @@ class MainActivity : ComponentActivity() {
                                     validityByHandle = validityByHandle,
                                     onUpdateRevocation = { updateRevocationStatus() },
                                     onRequestNewCredential = { requestNewCredential() },
-                                    onClearCredentials = {
-                                        credentials = emptyList()
-                                        selectedHandle = null
-                                        gapList = null
-                                        validityByHandle = emptyMap()
-                                        saveCredentials(context, emptyList())
-                                        keyManager.deleteKey()
-                                        try {
-                                            // Regenerate the key here; otherwise getCertificateChain() is empty on the next credential request.
-                                            refreshHolderKey()
-                                        } catch (e: Exception) {
-                                            errorMessage = "Key error: ${e.message}"
-                                        }
-                                    },
+                                    onOpenSettings = { currentScreen = AppScreen.Settings },
                                     onNavigateToScanner = {
                                         errorMessage = null
                                         currentScreen = AppScreen.Scanner
@@ -404,6 +482,25 @@ class MainActivity : ComponentActivity() {
                                 }
                             )
                         }
+                        is AppScreen.Settings -> {
+                            SettingsScreen(
+                                credentialsExist = credentials.isNotEmpty(),
+                                reloadStatusOnOpen = reloadStatusOnOpen,
+                                reloadStatusOnRedirect = reloadStatusOnRedirect,
+                                onReloadStatusOnOpenChanged = {
+                                    reloadStatusOnOpen = it
+                                    preferences.edit().putBoolean(RELOAD_STATUS_ON_OPEN_KEY, it).apply()
+                                },
+                                onReloadStatusOnRedirectChanged = {
+                                    reloadStatusOnRedirect = it
+                                    preferences.edit().putBoolean(RELOAD_STATUS_ON_REDIRECT_KEY, it).apply()
+                                },
+                                onResetUserKey = { resetUserKey() },
+                                onClearCredentials = { clearCredentials() },
+                                onClearAllData = { clearAllData() },
+                                onBack = { currentScreen = AppScreen.Home }
+                            )
+                        }
                     }
                 }
             }
@@ -428,20 +525,21 @@ fun DemoScreen(
     validityByHandle: Map<ULong, Boolean>,
     onUpdateRevocation: () -> Unit,
     onRequestNewCredential: () -> Unit,
-    onClearCredentials: () -> Unit,
+    onOpenSettings: () -> Unit,
     onNavigateToScanner: () -> Unit
 ) {
     val selectedCredential = credentials.find { it.revHandle() == selectedHandle }
     val selectedValid = selectedHandle?.let { validityByHandle[it] }
-    var showClearConfirmation by remember { mutableStateOf(false) }
+    val scrollState = rememberScrollState()
 
-    Column(
-        modifier = modifier
-            .padding(24.dp)
-            .verticalScroll(rememberScrollState()),
-        horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.Top
-    ) {
+    Box(modifier = modifier) {
+        Column(
+            modifier = Modifier
+                .padding(24.dp)
+                .verticalScroll(scrollState),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.Top
+        ) {
         ElevatedCard(
             modifier = Modifier.fillMaxWidth(),
             elevation = CardDefaults.elevatedCardElevation(defaultElevation = 6.dp)
@@ -450,7 +548,10 @@ fun DemoScreen(
                 modifier = Modifier.padding(16.dp),
                 horizontalAlignment = Alignment.Start
             ) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
                     Icon(
                         imageVector = Icons.Default.Key,
                         contentDescription = null,
@@ -462,6 +563,13 @@ fun DemoScreen(
                         style = MaterialTheme.typography.titleMedium,
                         color = MaterialTheme.colorScheme.primary
                     )
+                    Spacer(modifier = Modifier.weight(1f))
+                    IconButton(onClick = onOpenSettings) {
+                        Icon(
+                            imageVector = Icons.Default.Settings,
+                            contentDescription = "Settings"
+                        )
+                    }
                 }
                 Spacer(modifier = Modifier.height(16.dp))
 
@@ -542,24 +650,6 @@ fun DemoScreen(
             Text(if (credentials.isEmpty()) "Request Credential" else "Request New Credential")
         }
 
-        if (credentials.isNotEmpty()) {
-            Spacer(modifier = Modifier.height(8.dp))
-
-            Button(
-                modifier = Modifier.fillMaxWidth(),
-                onClick = { showClearConfirmation = true },
-                enabled = !isFetching,
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = MaterialTheme.colorScheme.error,
-                    contentColor = MaterialTheme.colorScheme.onError
-                )
-            ) {
-                Icon(Icons.Default.Delete, contentDescription = "Clear credentials")
-                Spacer(modifier = Modifier.size(8.dp))
-                Text("Clear All Credentials")
-            }
-        }
-
         Spacer(modifier = Modifier.height(16.dp))
 
         Button(
@@ -582,32 +672,6 @@ fun DemoScreen(
             Icon(Icons.Default.QrCodeScanner, contentDescription = null)
             Spacer(modifier = Modifier.size(8.dp))
             Text("Verify Credential")
-        }
-
-        if (showClearConfirmation) {
-            AlertDialog(
-                onDismissRequest = { showClearConfirmation = false },
-                title = { Text("Clear all credentials?") },
-                text = { Text("This will permanently remove all stored credentials from this device.") },
-                confirmButton = {
-                    TextButton(
-                        onClick = {
-                            showClearConfirmation = false
-                            onClearCredentials()
-                        },
-                        colors = ButtonDefaults.textButtonColors(
-                            contentColor = MaterialTheme.colorScheme.error
-                        )
-                    ) {
-                        Text("Clear All")
-                    }
-                },
-                dismissButton = {
-                    TextButton(onClick = { showClearConfirmation = false }) {
-                        Text("Cancel")
-                    }
-                }
-            )
         }
 
         if (errorMessage != null) {
@@ -635,6 +699,217 @@ fun DemoScreen(
                 }
             }
         }
+        }
+        ScrollIndicator(
+            scrollState = scrollState,
+            modifier = Modifier
+                .align(Alignment.CenterEnd)
+                .padding(end = 4.dp)
+        )
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun SettingsScreen(
+    credentialsExist: Boolean,
+    reloadStatusOnOpen: Boolean,
+    reloadStatusOnRedirect: Boolean,
+    onReloadStatusOnOpenChanged: (Boolean) -> Unit,
+    onReloadStatusOnRedirectChanged: (Boolean) -> Unit,
+    onResetUserKey: () -> Unit,
+    onClearCredentials: () -> Unit,
+    onClearAllData: () -> Unit,
+    onBack: () -> Unit
+) {
+    var showClearConfirmation by remember { mutableStateOf(false) }
+    var showResetKeyConfirmation by remember { mutableStateOf(false) }
+    var showClearAllConfirmation by remember { mutableStateOf(false) }
+    val scrollState = rememberScrollState()
+
+    BackHandler(onBack = onBack)
+
+    Scaffold(
+        topBar = {
+            CenterAlignedTopAppBar(
+                title = { Text("Settings") },
+                navigationIcon = {
+                    IconButton(onClick = onBack) {
+                        Icon(Icons.Default.ArrowBack, contentDescription = "Back")
+                    }
+                }
+            )
+        }
+    ) { innerPadding ->
+        Box(
+            modifier = Modifier
+                .padding(innerPadding)
+                .fillMaxSize()
+        ) {
+            Column(
+                modifier = Modifier
+                    .verticalScroll(scrollState)
+                    .padding(24.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+            SettingSwitchRow(
+                title = "Auto-Reload status on open",
+                checked = reloadStatusOnOpen,
+                onCheckedChange = onReloadStatusOnOpenChanged
+            )
+            SettingSwitchRow(
+                title = "Auto-Reload status on browser redirect",
+                checked = reloadStatusOnRedirect,
+                onCheckedChange = onReloadStatusOnRedirectChanged
+            )
+
+            Spacer(modifier = Modifier.height(16.dp))
+
+            Button(
+                modifier = Modifier.fillMaxWidth(),
+                enabled = credentialsExist,
+                onClick = { showClearConfirmation = true },
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = MaterialTheme.colorScheme.error,
+                    contentColor = MaterialTheme.colorScheme.onError
+                )
+            ) {
+                Icon(Icons.Default.Delete, contentDescription = null)
+                Spacer(modifier = Modifier.size(8.dp))
+                Text("Clear All Credentials")
+            }
+
+            Button(
+                modifier = Modifier.fillMaxWidth(),
+                onClick = { showResetKeyConfirmation = true },
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = MaterialTheme.colorScheme.error,
+                    contentColor = MaterialTheme.colorScheme.onError
+                )
+            ) {
+                Icon(Icons.Default.Key, contentDescription = null)
+                Spacer(modifier = Modifier.size(8.dp))
+                Text("Reset User Device Key")
+            }
+
+            Spacer(modifier = Modifier.height(24.dp))
+
+            Button(
+                modifier = Modifier.fillMaxWidth(),
+                onClick = { showClearAllConfirmation = true },
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = MaterialTheme.colorScheme.error,
+                    contentColor = MaterialTheme.colorScheme.onError
+                )
+            ) {
+                Icon(Icons.Default.Delete, contentDescription = null)
+                Spacer(modifier = Modifier.size(8.dp))
+                Text("Clear All Data")
+            }
+            }
+            ScrollIndicator(
+                scrollState = scrollState,
+                modifier = Modifier
+                    .align(Alignment.CenterEnd)
+                    .padding(end = 4.dp)
+            )
+        }
+    }
+
+    if (showClearConfirmation) {
+        AlertDialog(
+            onDismissRequest = { showClearConfirmation = false },
+            title = { Text("Clear all credentials?") },
+            text = { Text("This will permanently remove all stored credentials from this device.") },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        showClearConfirmation = false
+                        onClearCredentials()
+                    },
+                    colors = ButtonDefaults.textButtonColors(
+                        contentColor = MaterialTheme.colorScheme.error
+                    )
+                ) {
+                    Text("Clear All")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showClearConfirmation = false }) {
+                    Text("Cancel")
+                }
+            }
+        )
+    }
+
+    if (showResetKeyConfirmation) {
+        AlertDialog(
+            onDismissRequest = { showResetKeyConfirmation = false },
+            title = { Text("Reset user device key?") },
+            text = { Text("This invalidates credentials bound to the current key. Clear all old credentials after resetting the key, then request new credentials.") },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        showResetKeyConfirmation = false
+                        onResetUserKey()
+                    },
+                    colors = ButtonDefaults.textButtonColors(
+                        contentColor = MaterialTheme.colorScheme.error
+                    )
+                ) {
+                    Text("Reset Key")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showResetKeyConfirmation = false }) {
+                    Text("Cancel")
+                }
+            }
+        )
+    }
+
+    if (showClearAllConfirmation) {
+        AlertDialog(
+            onDismissRequest = { showClearAllConfirmation = false },
+            title = { Text("Clear all app data?") },
+            text = { Text("This resets credentials, settings, and the user device key to the initial app state.") },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        showClearAllConfirmation = false
+                        onClearAllData()
+                    },
+                    colors = ButtonDefaults.textButtonColors(
+                        contentColor = MaterialTheme.colorScheme.error
+                    )
+                ) {
+                    Text("Clear All Data")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showClearAllConfirmation = false }) {
+                    Text("Cancel")
+                }
+            }
+        )
+    }
+}
+
+@Composable
+fun SettingSwitchRow(
+    title: String,
+    checked: Boolean,
+    onCheckedChange: (Boolean) -> Unit
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable { onCheckedChange(!checked) }
+            .padding(vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Text(text = title, modifier = Modifier.weight(1f))
+        Switch(checked = checked, onCheckedChange = onCheckedChange)
     }
 }
 
@@ -743,6 +1018,7 @@ fun PresentationScreen(
     var presentationTime by remember { mutableStateOf<Long?>(null) }
     var verificationTime by remember { mutableStateOf<Long?>(null) }
     var revealedFields by remember { mutableStateOf<Set<String>>(emptySet()) }
+    val scrollState = rememberScrollState()
 
     val scope = rememberCoroutineScope()
     val credential = credentials.find { it.revHandle() == selectedHandle }
@@ -834,15 +1110,19 @@ fun PresentationScreen(
             )
         }
     ) { innerPadding ->
-        Column(
+        Box(
             modifier = Modifier
                 .padding(innerPadding)
                 .fillMaxSize()
-                .padding(24.dp)
-                .verticalScroll(rememberScrollState()),
-            horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.Top
         ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(24.dp)
+                    .verticalScroll(scrollState),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.Top
+            ) {
             if (!isConfirmed) {
                 if (credentials.isNotEmpty()) {
                     Text(
@@ -981,9 +1261,16 @@ fun PresentationScreen(
                     Text("Cancel")
                 }
             } else if (isProcessing) {
-                CircularProgressIndicator(modifier = Modifier.size(64.dp))
-                Spacer(modifier = Modifier.height(24.dp))
-                Text(statusText, style = MaterialTheme.typography.titleMedium)
+                Box(
+                    modifier = Modifier.fillMaxSize(),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                        CircularProgressIndicator(modifier = Modifier.size(64.dp))
+                        Spacer(modifier = Modifier.height(24.dp))
+                        Text(statusText, style = MaterialTheme.typography.titleMedium)
+                    }
+                }
             } else {
                 Icon(
                     imageVector = if (success) Icons.Default.CheckCircle else Icons.Default.Error,
@@ -1033,6 +1320,13 @@ fun PresentationScreen(
                     Text("OK")
                 }
             }
+            }
+            ScrollIndicator(
+                scrollState = scrollState,
+                modifier = Modifier
+                    .align(Alignment.CenterEnd)
+                    .padding(end = 4.dp)
+            )
         }
     }
 }
@@ -1298,7 +1592,7 @@ fun DemoScreenPreview() {
             validityByHandle = emptyMap(),
             onUpdateRevocation = {},
             onRequestNewCredential = {},
-            onClearCredentials = {},
+            onOpenSettings = {},
             onNavigateToScanner = {}
         )
     }
