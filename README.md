@@ -3,11 +3,11 @@
 A demo implementation of an anonymous credential system in the commit-and-prove paradigm,
 following the approach described in
 ["Vision: A Modular Framework for Anonymous Credential Systems"](https://eprint.iacr.org/2025/1981)
-by A. Lehmann, A. Sidorenko, and A. Zacharakis.
+by A. Lehmann, A. Sidorenko, and A. Zacharakis. Revocation is implemented using the signed-pairs approach (instantiated with BBS-BP), as described in ["Comparing Privacy-Preserving Revocation for the EUDI Wallet"](https://eprint.iacr.org/2026/1824).
 
 The concrete use case is age verification: a credential holder proves they are 18 years
 old without revealing any other attribute, and without the verifier being able to track or
-link individual presentations.
+link individual presentations. 
 
 A current deployed version of the demo is available at
 [av-demo.hpi.de](https://av-demo.hpi.de).
@@ -27,8 +27,8 @@ wallet/              # Android app (Jetpack Compose) — holder demo
 
 Implements the full commit-and-prove anonymous credential scheme on BLS12-381 / BBS+ 23:
 
-- **`Issuer`** — signs credentials using BBS+ 23, embedding a holder P-256 public key.
-- **`CommittedDisclosurePresenter`** — produces a `Presentation` composed of three
+- **`Issuer`** — signs credentials using BBS+ 23, embedding a holder P-256 public key and a `rev_handle`.
+- **`CommittedDisclosurePresenter`** — produces a `Presentation` composed of four
   sub-proofs:
   1. **Base proof** — PoK of BBS+ signature with selective disclosure and Pedersen
      commitments to the hidden messages.
@@ -36,7 +36,10 @@ Implements the full commit-and-prove anonymous credential scheme on BLS12-381 / 
      committed timestamps.
   3. **Holder-binding proof** — equality-across-groups proofs (tom256 ↔ BLS12-381) plus a
      PoK of ECDSA signature under the committed P-256 holder key.
-- **`CommittedDisclosureVerifier`** — verifies all three sub-proofs.
+  4. **Non-revocation proof** — credential validity via signed-pairs, PoK of a BBS+ 
+     signature disclosing the current revocation epoch and Bulletproofs++ range proof 
+     that `rid_lo < rev_handle < rid_hi`.
+- **`CommittedDisclosureVerifier`** — verifies all four sub-proofs.
 
 ### `crypto/agever`
 
@@ -84,7 +87,8 @@ An Android application (min SDK 31, target SDK 37) that:
 
 1. Generates a P-256 key pair in the StrongBox secure element, if available.
 2. Requests and stores a JWT credential from the `/issue` endpoint.
-3. Scans a QR code from the verifier web page and submits a ZK presentation to `/validate`.
+3. Updates the current status of the credential.
+4. Scans a QR code from the verifier web page and submits a ZK presentation to `/validate`.
 
 ## Building and running
 
@@ -127,7 +131,7 @@ docker run -p 3000:3000 agever-demo-srv
 - Docker (for the containerized build and run)
 
 ### Android wallet
-
+The wallet app is compatible with Android 10 and newer. You can compile the APK as follows:
 ```bash
 cd wallet
 ./gradlew assembleDebug
