@@ -119,6 +119,8 @@ sealed class AppScreen(val order: Int) {
 
 private const val CREDENTIALS_PREFS = "wallet_credentials"
 private const val CREDENTIALS_KEY = "credentials_jwt"
+private const val REVOCATION_STATUS_KEY = "revocation_status_jwt"
+private const val REUSE_REVOCATION_STATUS_KEY = "reuse_revocation_status"
 private const val RELOAD_STATUS_ON_OPEN_KEY = "reload_status_on_open"
 private const val RELOAD_STATUS_ON_REDIRECT_KEY = "reload_status_on_redirect"
 
@@ -185,6 +187,37 @@ private fun saveCredentials(context: Context, credentials: List<AgeVerCredential
         .apply()
 }
 
+private fun loadStoredRevocationStatus(context: Context): List<AgeVerGapCredential> {
+    val storedStatus = context
+        .getSharedPreferences(CREDENTIALS_PREFS, Context.MODE_PRIVATE)
+        .getString(REVOCATION_STATUS_KEY, null)
+        ?: return emptyList()
+
+    return try {
+        val statusJson = JSONArray(storedStatus)
+        (0 until statusJson.length()).mapNotNull { index ->
+            try {
+                uniffi.agever.gapCredentialFromJwt(statusJson.getString(index))
+            } catch (_: Exception) {
+                null
+            }
+        }
+    } catch (_: Exception) {
+        emptyList()
+    }
+}
+
+private fun saveRevocationStatus(context: Context, gaps: List<AgeVerGapCredential>) {
+    val statusJson = JSONArray().apply {
+        gaps.forEach { put(it.toJwt()) }
+    }
+    context
+        .getSharedPreferences(CREDENTIALS_PREFS, Context.MODE_PRIVATE)
+        .edit()
+        .putString(REVOCATION_STATUS_KEY, statusJson.toString())
+        .apply()
+}
+
 class MainActivity : ComponentActivity() {
     private var deepLinkSessionId = mutableStateOf<String?>(null)
 
@@ -220,6 +253,7 @@ class MainActivity : ComponentActivity() {
                 context.getSharedPreferences(CREDENTIALS_PREFS, Context.MODE_PRIVATE)
             }
             val storedCredentials = remember(context) { loadStoredCredentials(context) }
+            val storedRevocationStatus = remember(context) { loadStoredRevocationStatus(context) }
             var credentials by remember { mutableStateOf(storedCredentials) }
             var selectedHandle by remember { mutableStateOf(storedCredentials.firstOrNull()?.revHandle()) }
             var holderPublicKey by remember { mutableStateOf<AgeVerHolderPublicKey?>(null) }
@@ -227,13 +261,31 @@ class MainActivity : ComponentActivity() {
             var isFetching by remember { mutableStateOf(false) }
             var errorMessage by remember { mutableStateOf<String?>(null) }
 
-            var gapList by remember { mutableStateOf<List<AgeVerGapCredential>?>(null) }
+            var reuseRevocationStatus by remember {
+                mutableStateOf(preferences.getBoolean(REUSE_REVOCATION_STATUS_KEY, true))
+            }
+            var gapList by remember {
+                mutableStateOf<List<AgeVerGapCredential>?>(
+                    storedRevocationStatus.takeIf { reuseRevocationStatus }
+                )
+            }
             var isUpdatingRevocation by remember { mutableStateOf(false) }
             var revocationUpdateTime by remember { mutableStateOf<Long?>(null) }
+            var revocationStatusFromCache by remember {
+                mutableStateOf(reuseRevocationStatus && storedRevocationStatus.isNotEmpty())
+            }
             var revocationUpdateError by remember { mutableStateOf<String?>(null) }
             // Only entries for credentials that have actually been checked against a fetched
             // gap list are present here - absence (not false) means "not checked yet".
-            var validityByHandle by remember { mutableStateOf<Map<ULong, Boolean>>(emptyMap()) }
+            var validityByHandle by remember {
+                mutableStateOf<Map<ULong, Boolean>>(
+                    gapList?.let { gaps ->
+                        storedCredentials.associate { cred ->
+                            cred.revHandle() to (uniffi.agever.findBracket(gaps, cred.revHandle()) != null)
+                        }
+                    } ?: emptyMap<ULong, Boolean>()
+                )
+            }
             var reloadStatusOnOpen by remember {
                 mutableStateOf(preferences.getBoolean(RELOAD_STATUS_ON_OPEN_KEY, false))
             }
@@ -281,6 +333,12 @@ class MainActivity : ComponentActivity() {
                             parsedGapList to parsedValidityByHandle
                         }
                         gapList = freshGapList
+                        revocationStatusFromCache = false
+                        if (reuseRevocationStatus) {
+                            saveRevocationStatus(context, freshGapList)
+                        } else {
+                            preferences.edit().remove(REVOCATION_STATUS_KEY).apply()
+                        }
                         validityByHandle = freshValidityByHandle
                         revocationUpdateTime = System.currentTimeMillis() - start
                     } catch (e: Exception) {
@@ -351,8 +409,10 @@ class MainActivity : ComponentActivity() {
                 credentials = emptyList()
                 selectedHandle = null
                 gapList = null
-                validityByHandle = emptyMap()
+                revocationStatusFromCache = false
+                validityByHandle = emptyMap<ULong, Boolean>()
                 saveCredentials(context, emptyList())
+                preferences.edit().remove(REVOCATION_STATUS_KEY).apply()
             }
 
             fun resetUserKey() {
@@ -369,6 +429,7 @@ class MainActivity : ComponentActivity() {
                 preferences.edit().clear().apply()
                 reloadStatusOnOpen = false
                 reloadStatusOnRedirect = false
+                reuseRevocationStatus = true
                 resetUserKey()
             }
 
@@ -438,6 +499,7 @@ class MainActivity : ComponentActivity() {
                                     isUpdatingRevocation = isUpdatingRevocation,
                                     revocationUpdateTime = revocationUpdateTime,
                                     revocationUpdateError = revocationUpdateError,
+                                    revocationStatusFromCache = revocationStatusFromCache,
                                     validityByHandle = validityByHandle,
                                     onUpdateRevocation = { updateRevocationStatus() },
                                     onRequestNewCredential = { requestNewCredential() },
@@ -469,6 +531,7 @@ class MainActivity : ComponentActivity() {
                                 client = client,
                                 url = url2,
                                 isRefreshingStatus = isUpdatingRevocation,
+                                revocationStatusFromCache = revocationStatusFromCache,
                                 onRefreshStatus = { updateRevocationStatus() },
                                 onFinish = { success, msg ->
                                     if (!success) {
@@ -487,6 +550,7 @@ class MainActivity : ComponentActivity() {
                                 credentialsExist = credentials.isNotEmpty(),
                                 reloadStatusOnOpen = reloadStatusOnOpen,
                                 reloadStatusOnRedirect = reloadStatusOnRedirect,
+                                reuseRevocationStatus = reuseRevocationStatus,
                                 onReloadStatusOnOpenChanged = {
                                     reloadStatusOnOpen = it
                                     preferences.edit().putBoolean(RELOAD_STATUS_ON_OPEN_KEY, it).apply()
@@ -494,6 +558,22 @@ class MainActivity : ComponentActivity() {
                                 onReloadStatusOnRedirectChanged = {
                                     reloadStatusOnRedirect = it
                                     preferences.edit().putBoolean(RELOAD_STATUS_ON_REDIRECT_KEY, it).apply()
+                                },
+                                onReuseRevocationStatusChanged = {
+                                    reuseRevocationStatus = it
+                                    preferences.edit().putBoolean(REUSE_REVOCATION_STATUS_KEY, it).apply()
+                                    if (it) {
+                                        gapList = loadStoredRevocationStatus(context)
+                                        revocationStatusFromCache = gapList?.isNotEmpty() == true
+                                        validityByHandle = credentials.associate { cred ->
+                                            cred.revHandle() to (uniffi.agever.findBracket(gapList.orEmpty(), cred.revHandle()) != null)
+                                        }
+                                    } else {
+                                        gapList = null
+                                        revocationStatusFromCache = false
+                                        validityByHandle = emptyMap<ULong, Boolean>()
+                                        preferences.edit().remove(REVOCATION_STATUS_KEY).apply()
+                                    }
                                 },
                                 onResetUserKey = { resetUserKey() },
                                 onClearCredentials = { clearCredentials() },
@@ -522,6 +602,7 @@ fun DemoScreen(
     isUpdatingRevocation: Boolean,
     revocationUpdateTime: Long?,
     revocationUpdateError: String?,
+    revocationStatusFromCache: Boolean,
     validityByHandle: Map<ULong, Boolean>,
     onUpdateRevocation: () -> Unit,
     onRequestNewCredential: () -> Unit,
@@ -595,7 +676,8 @@ fun DemoScreen(
                         selectedCredential == null -> null
                         revocationUpdateError != null -> revocationUpdateError
                         selectedValid == false -> "This credential is no longer valid"
-                        selectedValid == true -> "Updated in ${revocationUpdateTime}ms"
+                        selectedValid == true && revocationStatusFromCache -> "Status loaded from cache"
+                        selectedValid == true -> "Updated in ${revocationUpdateTime ?: 0}ms"
                         gapList != null -> "Refresh to check this credential"
                         else -> "Not fetched yet"
                     },
@@ -715,8 +797,10 @@ fun SettingsScreen(
     credentialsExist: Boolean,
     reloadStatusOnOpen: Boolean,
     reloadStatusOnRedirect: Boolean,
+    reuseRevocationStatus: Boolean,
     onReloadStatusOnOpenChanged: (Boolean) -> Unit,
     onReloadStatusOnRedirectChanged: (Boolean) -> Unit,
+    onReuseRevocationStatusChanged: (Boolean) -> Unit,
     onResetUserKey: () -> Unit,
     onClearCredentials: () -> Unit,
     onClearAllData: () -> Unit,
@@ -762,6 +846,11 @@ fun SettingsScreen(
                 checked = reloadStatusOnRedirect,
                 onCheckedChange = onReloadStatusOnRedirectChanged
             )
+            SettingSwitchRow(
+                title = "Reuse saved revocation status",
+                checked = reuseRevocationStatus,
+                onCheckedChange = onReuseRevocationStatusChanged
+            )
 
             Spacer(modifier = Modifier.height(16.dp))
 
@@ -804,7 +893,7 @@ fun SettingsScreen(
             ) {
                 Icon(Icons.Default.Delete, contentDescription = null)
                 Spacer(modifier = Modifier.size(8.dp))
-                Text("Clear All Data")
+                Text("Erase All Data")
             }
             }
             ScrollIndicator(
@@ -871,7 +960,7 @@ fun SettingsScreen(
     if (showClearAllConfirmation) {
         AlertDialog(
             onDismissRequest = { showClearAllConfirmation = false },
-            title = { Text("Clear all app data?") },
+            title = { Text("Erase all app data?") },
             text = { Text("This resets credentials, settings, and the user device key to the initial app state.") },
             confirmButton = {
                 TextButton(
@@ -883,7 +972,7 @@ fun SettingsScreen(
                         contentColor = MaterialTheme.colorScheme.error
                     )
                 ) {
-                    Text("Clear All Data")
+                    Text("Erase All Data")
                 }
             },
             dismissButton = {
@@ -1006,6 +1095,7 @@ fun PresentationScreen(
     client: OkHttpClient,
     url: String,
     isRefreshingStatus: Boolean,
+    revocationStatusFromCache: Boolean,
     onRefreshStatus: () -> Unit,
     onFinish: (Boolean, String?) -> Unit
 ) {
@@ -1225,6 +1315,7 @@ fun PresentationScreen(
                     subtitle = when {
                         credential == null -> null
                         selectedValid == false -> "This credential is no longer valid"
+                        selectedValid == true && revocationStatusFromCache -> "Status refreshed from cache"
                         selectedValid == true -> "Status refreshed"
                         gapList != null -> "Refresh to check this credential"
                         else -> "Not fetched yet"
@@ -1589,6 +1680,7 @@ fun DemoScreenPreview() {
             isUpdatingRevocation = false,
             revocationUpdateTime = null,
             revocationUpdateError = null,
+            revocationStatusFromCache = false,
             validityByHandle = emptyMap(),
             onUpdateRevocation = {},
             onRequestNewCredential = {},
