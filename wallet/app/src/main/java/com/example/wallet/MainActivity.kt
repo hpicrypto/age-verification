@@ -743,10 +743,12 @@ fun PresentationScreen(
     var presentationTime by remember { mutableStateOf<Long?>(null) }
     var verificationTime by remember { mutableStateOf<Long?>(null) }
     var revealedFields by remember { mutableStateOf<Set<String>>(emptySet()) }
-    var showRevocationData by remember { mutableStateOf(false) }
 
     val scope = rememberCoroutineScope()
     val credential = credentials.find { it.revHandle() == selectedHandle }
+    val revocationBracket = credential?.let { selectedCredential ->
+        gapList?.let { gaps -> uniffi.agever.findBracket(gaps, selectedCredential.revHandle()) }
+    }
     val selectedValid = credential?.revHandle()?.let { revHandle ->
         gapList?.let { gaps -> uniffi.agever.findBracket(gaps, revHandle) != null }
     }
@@ -877,7 +879,7 @@ fun PresentationScreen(
                 )
                 Spacer(modifier = Modifier.height(24.dp))
 
-                val displayClaims = remember(credential) {
+                val displayClaims = remember(credential, revocationBracket) {
                     try {
                         val original = JSONObject(credential?.claimsJsonStr() ?: "{}")
                         val modified = JSONObject()
@@ -905,6 +907,14 @@ fun PresentationScreen(
                             .put("type", "string")
                             .put("display", "later than $now")
                             .put("actual", original.optJSONObject("exp")?.optString("val", "N/A") ?: "N/A"))
+                        revocationBracket?.let { bracket ->
+                            val bracketClaims = JSONObject(bracket.claimsJsonStr())
+                            val epoch = bracketClaims.optJSONObject("epoch")?.optString("val", "N/A") ?: "N/A"
+                            modified.put("revocation", JSONObject()
+                                .put("type", "string")
+                                .put("display", "is not revoked at epoch $epoch")
+                                .put("actual", bracketClaims.toString(2)))
+                        }
                         modified
                     } catch (e: Exception) {
                         JSONObject()
@@ -921,91 +931,6 @@ fun PresentationScreen(
                                 revealedFields - field
                             } else {
                                 revealedFields + field
-                            }
-                        }
-                    }
-                }
-
-                if (gapList != null && gapList!!.isNotEmpty() && credential != null) {
-                    Spacer(modifier = Modifier.height(24.dp))
-                    
-                    val bracket = uniffi.agever.findBracket(gapList!!, credential!!.revHandle())
-                    
-                    if (bracket != null) {
-                        ElevatedCard(
-                            modifier = Modifier.fillMaxWidth(),
-                            elevation = CardDefaults.elevatedCardElevation(defaultElevation = 4.dp)
-                        ) {
-                            Column(modifier = Modifier.padding(16.dp)) {
-                                Text(
-                                    text = "Revocation Data Shared",
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = MaterialTheme.colorScheme.outline
-                                )
-                                Spacer(modifier = Modifier.height(8.dp))
-                                
-                                val claimsJson = remember(bracket) {
-                                    try { JSONObject(bracket.claimsJsonStr()) } catch (e: Exception) { null }
-                                }
-                                
-                                val formattedClaimsStr = remember(claimsJson) {
-                                    claimsJson?.let {
-                                        try {
-                                            // Format JSON with proper handling of u64 string values
-                                            val formatted = StringBuilder()
-                                            val keysIterator = it.keys()
-                                            val keysList = keysIterator.asSequence().toList()
-                                            
-                                            keysList.forEachIndexed { index, key ->
-                                                val obj = it.getJSONObject(key)
-                                                val type = obj.optString("type")
-                                                val val_str = obj.optString("val")
-                                                
-                                                formatted.append("\"").append(key).append("\": ")
-                                                if (type == "raw") {
-                                                    // Display u64 string values as plain integers
-                                                    formatted.append(val_str)
-                                                } else {
-                                                    formatted.append("\"").append(val_str).append("\"")
-                                                }
-                                                if (index < keysList.size - 1) {
-                                                    formatted.append(", ")
-                                                }
-                                            }
-                                            "{ " + formatted.toString() + " }"
-                                        } catch (e: Exception) {
-                                            it.toString()
-                                        }
-                                    } ?: "N/A"
-                                }
-                                
-                                claimsJson?.let { claims ->
-                                    Text(
-                                        text = "Tap to ${if (showRevocationData) "hide" else "reveal"} revocation epoch & commitment",
-                                        style = MaterialTheme.typography.labelSmall,
-                                        color = MaterialTheme.colorScheme.outline,
-                                        modifier = Modifier
-                                            .fillMaxWidth()
-                                            .clickable { showRevocationData = !showRevocationData }
-                                            .padding(8.dp)
-                                    )
-                                    
-                                    if (showRevocationData) {
-                                        Text(
-                                            text = formattedClaimsStr,
-                                            style = MaterialTheme.typography.labelSmall.copy(
-                                                fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace,
-                                                fontSize = androidx.compose.material3.MaterialTheme.typography.labelSmall.fontSize * 0.85f
-                                            ),
-                                            color = MaterialTheme.colorScheme.outline,
-                                            modifier = Modifier
-                                                .fillMaxWidth()
-                                                .padding(8.dp)
-                                                .background(MaterialTheme.colorScheme.surfaceVariant, shape = RoundedCornerShape(4.dp))
-                                                .padding(8.dp)
-                                        )
-                                    }
-                                }
                             }
                         }
                     }
@@ -1139,7 +1064,8 @@ fun RevealableClaimsList(
         "above16" to "Above 16",
         "above18" to "Above 18",
         "nbf" to "Valid From",
-        "exp" to "Expires At"
+        "exp" to "Expires At",
+        "revocation" to "Revocation"
     )
     displayKeys.forEach { (key, label) ->
         claimsJson.optJSONObject(key)?.let { valueObj ->
