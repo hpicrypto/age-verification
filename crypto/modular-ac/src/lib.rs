@@ -733,18 +733,27 @@ impl CommittedDisclosureVerifier {
 
     pub fn verify_holder_binding_proof<R: RngCore>(&self, rng: &mut R, commitments : &IndexMap<G1Affine>, nonce : &Nonce, pop: &ProofOfPossession) -> Result<(), Error> {
         
-        let pk_idxs = self.params.schema.get(&"holder_pk".to_string()).expect("holder_pk not found in schema");
+        let pk_idxs = self.params.schema.get(&"holder_pk".to_string())
+            .ok_or_else(|| Error::VerificationFailed("holder_pk not found in schema".to_string()))?;
+
+        if pop.comms.len() != HOLDER_PK_NUM_CHUNKS * 2 {
+            return Err(Error::VerificationFailed("invalid holder public key commitment count".to_string()));
+        }
+        if pop.eq_proofs.len() != pk_idxs.len() {
+            return Err(Error::VerificationFailed("invalid holder key equality proof count".to_string()));
+        }
 
         // verifies the proof that the Tom256 commitments are well-formed verifies.
         for ((pk_field_idx, pk_com_pop_tom256), eq_proof) in pk_idxs.zip(pop.comms.iter()).zip(pop.clone().eq_proofs) {
-            let pk_com_cd = commitments.get(&pk_field_idx).expect("commitment not found in committed disclosure");
+            let pk_com_cd = commitments.get(&pk_field_idx)
+                .ok_or_else(|| Error::VerificationFailed("commitment not found in committed disclosure".to_string()))?;
             eq_proof.verify(
                     &pk_com_pop_tom256,
                     &pk_com_cd,
                     &self.params.comm_key_tom256,
                     &self.params.comm_key,
                     &mut new_merlin_transcript(b"holder binding proof"),
-                ).unwrap();
+                ).map_err(|e| Error::VerificationFailed(format!("holder key equality proof failed: {:?}", e)))?;
         }
 
        // Compute the commitment to the pk on the tom256 curve from the committed disclosure
@@ -759,8 +768,10 @@ impl CommittedDisclosureVerifier {
         }).collect::<Vec<Tom256Fr>>();
         let rec_base_p = rec_base.as_slice();
 
-        let pk_com_x_tom256 = Tom256Projective::msm(pk_comms_x_tom256, rec_base_p).unwrap();
-        let pk_com_y_tom256 = Tom256Projective::msm(pk_comms_y_tom256, rec_base_p).unwrap();
+           let pk_com_x_tom256 = Tom256Projective::msm(pk_comms_x_tom256, rec_base_p)
+               .map_err(|e| Error::VerificationFailed(format!("invalid holder key x commitment: {:?}", e)))?;
+           let pk_com_y_tom256 = Tom256Projective::msm(pk_comms_y_tom256, rec_base_p)
+               .map_err(|e| Error::VerificationFailed(format!("invalid holder key y commitment: {:?}", e)))?;
         let pk_com_tom256 = PointCommitment{
             x: pk_com_x_tom256.into_affine(),
             y: pk_com_y_tom256.into_affine(),
@@ -768,7 +779,8 @@ impl CommittedDisclosureVerifier {
 
         // verifies the proof of knowledge of a signature that verifies under the committed pk.
         let mut transcript = new_merlin_transcript(b"test");
-        pop.sig_proof.challenge_contribution( &mut transcript).unwrap();
+        pop.sig_proof.challenge_contribution( &mut transcript)
+            .map_err(|e| Error::VerificationFailed(format!("invalid holder signature proof: {:?}", e)))?;
         let challenge = transcript.challenge_scalar(b"test");
  
         let nonce_scalar = SecP256Fr::from_be_bytes_mod_order(&Sha256::digest(nonce));

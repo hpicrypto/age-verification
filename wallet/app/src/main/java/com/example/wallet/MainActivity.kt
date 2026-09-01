@@ -1,10 +1,12 @@
 package com.example.wallet
 
+import android.content.Context
 import android.content.Intent
 import android.os.Bundle
 import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.activity.compose.BackHandler
 import androidx.activity.enableEdgeToEdge
 import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
 import androidx.compose.animation.*
@@ -13,23 +15,33 @@ import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.ScrollState
+import androidx.compose.foundation.background
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.offset
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Cancel
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Error
 import androidx.compose.material.icons.filled.Key
 import androidx.compose.material.icons.filled.QrCodeScanner
+import androidx.compose.material.icons.filled.ArrowBack
+import androidx.compose.material.icons.filled.Settings
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -38,9 +50,12 @@ import androidx.compose.material3.CenterAlignedTopAppBar
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ElevatedCard
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBarDefaults
@@ -53,9 +68,12 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
@@ -79,6 +97,8 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.concurrent.TimeUnit
+import kotlin.math.max
+import kotlin.math.roundToInt
 import okhttp3.FormBody
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
@@ -94,6 +114,108 @@ sealed class AppScreen(val order: Int) {
     object Home : AppScreen(0)
     object Scanner : AppScreen(1)
     data class Presentation(val sessionId: String, val isDeepLink: Boolean = false) : AppScreen(2)
+    object Settings : AppScreen(3)
+}
+
+private const val CREDENTIALS_PREFS = "wallet_credentials"
+private const val CREDENTIALS_KEY = "credentials_jwt"
+private const val REVOCATION_STATUS_KEY = "revocation_status_jwt"
+private const val REUSE_REVOCATION_STATUS_KEY = "reuse_revocation_status"
+private const val RELOAD_STATUS_ON_OPEN_KEY = "reload_status_on_open"
+private const val RELOAD_STATUS_ON_REDIRECT_KEY = "reload_status_on_redirect"
+
+@Composable
+private fun ScrollIndicator(scrollState: ScrollState, modifier: Modifier = Modifier) {
+    if (scrollState.maxValue == 0 || scrollState.viewportSize == 0) return
+
+    BoxWithConstraints(
+        modifier = modifier
+            .width(3.dp)
+            .fillMaxHeight()
+            .padding(vertical = 2.dp)
+            .clip(RoundedCornerShape(2.dp))
+            .background(MaterialTheme.colorScheme.surfaceVariant)
+    ) {
+        val trackHeight = constraints.maxHeight
+        val contentHeight = scrollState.viewportSize + scrollState.maxValue
+        val thumbHeight = max(
+            with(LocalDensity.current) { 12.dp.toPx().roundToInt() },
+            (trackHeight * scrollState.viewportSize / contentHeight)
+        )
+            .coerceAtMost(trackHeight)
+        val thumbOffset = ((trackHeight - thumbHeight) * scrollState.value / scrollState.maxValue)
+
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(with(LocalDensity.current) { thumbHeight.toDp() })
+                .offset { IntOffset(0, thumbOffset) }
+                .clip(RoundedCornerShape(2.dp))
+                .background(MaterialTheme.colorScheme.outline)
+        )
+    }
+}
+
+private fun loadStoredCredentials(context: Context): List<AgeVerCredential> {
+    val storedCredentials = context
+        .getSharedPreferences(CREDENTIALS_PREFS, Context.MODE_PRIVATE)
+        .getString(CREDENTIALS_KEY, null)
+        ?: return emptyList()
+
+    return try {
+        val credentialsJson = JSONArray(storedCredentials)
+        (0 until credentialsJson.length()).mapNotNull { index ->
+            try {
+                uniffi.agever.credentialFromJwt(credentialsJson.getString(index))
+            } catch (_: Exception) {
+                null
+            }
+        }
+    } catch (_: Exception) {
+        emptyList()
+    }
+}
+
+private fun saveCredentials(context: Context, credentials: List<AgeVerCredential>) {
+    val credentialsJson = JSONArray().apply {
+        credentials.forEach { put(it.toJwt()) }
+    }
+    context
+        .getSharedPreferences(CREDENTIALS_PREFS, Context.MODE_PRIVATE)
+        .edit()
+        .putString(CREDENTIALS_KEY, credentialsJson.toString())
+        .apply()
+}
+
+private fun loadStoredRevocationStatus(context: Context): List<AgeVerGapCredential> {
+    val storedStatus = context
+        .getSharedPreferences(CREDENTIALS_PREFS, Context.MODE_PRIVATE)
+        .getString(REVOCATION_STATUS_KEY, null)
+        ?: return emptyList()
+
+    return try {
+        val statusJson = JSONArray(storedStatus)
+        (0 until statusJson.length()).mapNotNull { index ->
+            try {
+                uniffi.agever.gapCredentialFromJwt(statusJson.getString(index))
+            } catch (_: Exception) {
+                null
+            }
+        }
+    } catch (_: Exception) {
+        emptyList()
+    }
+}
+
+private fun saveRevocationStatus(context: Context, gaps: List<AgeVerGapCredential>) {
+    val statusJson = JSONArray().apply {
+        gaps.forEach { put(it.toJwt()) }
+    }
+    context
+        .getSharedPreferences(CREDENTIALS_PREFS, Context.MODE_PRIVATE)
+        .edit()
+        .putString(REVOCATION_STATUS_KEY, statusJson.toString())
+        .apply()
 }
 
 class MainActivity : ComponentActivity() {
@@ -126,30 +248,52 @@ class MainActivity : ComponentActivity() {
             var currentScreen by remember { mutableStateOf<AppScreen>(AppScreen.Home) }
 
             val dlSessionId by deepLinkSessionId
-            LaunchedEffect(dlSessionId) {
-                dlSessionId?.let {
-                    currentScreen = AppScreen.Presentation(it, isDeepLink = true)
-                    deepLinkSessionId.value = null
-                }
+            val context = androidx.compose.ui.platform.LocalContext.current
+            val preferences = remember(context) {
+                context.getSharedPreferences(CREDENTIALS_PREFS, Context.MODE_PRIVATE)
             }
-
-            var credentials by remember { mutableStateOf<List<AgeVerCredential>>(emptyList()) }
-            var selectedHandle by remember { mutableStateOf<ULong?>(null) }
+            val storedCredentials = remember(context) { loadStoredCredentials(context) }
+            val storedRevocationStatus = remember(context) { loadStoredRevocationStatus(context) }
+            var credentials by remember { mutableStateOf(storedCredentials) }
+            var selectedHandle by remember { mutableStateOf(storedCredentials.firstOrNull()?.revHandle()) }
             var holderPublicKey by remember { mutableStateOf<AgeVerHolderPublicKey?>(null) }
             var isHardwareBacked by remember { mutableStateOf(false) }
             var isFetching by remember { mutableStateOf(false) }
             var errorMessage by remember { mutableStateOf<String?>(null) }
 
-            var gapList by remember { mutableStateOf<List<AgeVerGapCredential>?>(null) }
+            var reuseRevocationStatus by remember {
+                mutableStateOf(preferences.getBoolean(REUSE_REVOCATION_STATUS_KEY, true))
+            }
+            var gapList by remember {
+                mutableStateOf<List<AgeVerGapCredential>?>(
+                    storedRevocationStatus.takeIf { reuseRevocationStatus }
+                )
+            }
             var isUpdatingRevocation by remember { mutableStateOf(false) }
             var revocationUpdateTime by remember { mutableStateOf<Long?>(null) }
+            var revocationStatusFromCache by remember {
+                mutableStateOf(reuseRevocationStatus && storedRevocationStatus.isNotEmpty())
+            }
             var revocationUpdateError by remember { mutableStateOf<String?>(null) }
             // Only entries for credentials that have actually been checked against a fetched
             // gap list are present here - absence (not false) means "not checked yet".
-            var validityByHandle by remember { mutableStateOf<Map<ULong, Boolean>>(emptyMap()) }
+            var validityByHandle by remember {
+                mutableStateOf<Map<ULong, Boolean>>(
+                    gapList?.let { gaps ->
+                        storedCredentials.associate { cred ->
+                            cred.revHandle() to (uniffi.agever.findBracket(gaps, cred.revHandle()) != null)
+                        }
+                    } ?: emptyMap<ULong, Boolean>()
+                )
+            }
+            var reloadStatusOnOpen by remember {
+                mutableStateOf(preferences.getBoolean(RELOAD_STATUS_ON_OPEN_KEY, false))
+            }
+            var reloadStatusOnRedirect by remember {
+                mutableStateOf(preferences.getBoolean(RELOAD_STATUS_ON_REDIRECT_KEY, false))
+            }
             val scope = rememberCoroutineScope()
 
-            val context = androidx.compose.ui.platform.LocalContext.current
             val keyManager = remember { HardwareKeyManager(context) }
 
             val cameraPermissionState = rememberPermissionState(android.Manifest.permission.CAMERA)
@@ -161,9 +305,10 @@ class MainActivity : ComponentActivity() {
                     .build()
             }
 
-            val url1 = "http://127.0.0.1/issue"
-            val url2 = "http://127.0.0.1/validate"
-            val url3 = "http://127.0.0.1/revocation-status"
+            val urlbase = "http://127.0.0.1"
+            val url1 = urlbase + "/issue"
+            val url2 = urlbase + "/validate"
+            val url3 = urlbase + "/revocation-status"
 
             fun updateRevocationStatus() {
                 isUpdatingRevocation = true
@@ -188,6 +333,12 @@ class MainActivity : ComponentActivity() {
                             parsedGapList to parsedValidityByHandle
                         }
                         gapList = freshGapList
+                        revocationStatusFromCache = false
+                        if (reuseRevocationStatus) {
+                            saveRevocationStatus(context, freshGapList)
+                        } else {
+                            preferences.edit().remove(REVOCATION_STATUS_KEY).apply()
+                        }
                         validityByHandle = freshValidityByHandle
                         revocationUpdateTime = System.currentTimeMillis() - start
                     } catch (e: Exception) {
@@ -195,6 +346,16 @@ class MainActivity : ComponentActivity() {
                     } finally {
                         isUpdatingRevocation = false
                     }
+                }
+            }
+
+            LaunchedEffect(dlSessionId) {
+                dlSessionId?.let { sessionId ->
+                    if (reloadStatusOnRedirect) {
+                        updateRevocationStatus()
+                    }
+                    currentScreen = AppScreen.Presentation(sessionId, isDeepLink = true)
+                    deepLinkSessionId.value = null
                 }
             }
 
@@ -222,7 +383,9 @@ class MainActivity : ComponentActivity() {
                             }
                         }
                         val newCredential = uniffi.agever.credentialFromJwt(result.orEmpty())
-                        credentials = credentials + newCredential
+                        val updatedCredentials = credentials + newCredential
+                        credentials = updatedCredentials
+                        saveCredentials(context, updatedCredentials)
                         selectedHandle = newCredential.revHandle()
                     } catch (e: Exception) {
                         errorMessage = e.message
@@ -232,26 +395,63 @@ class MainActivity : ComponentActivity() {
                 }
             }
 
+            fun refreshHolderKey() {
+                val cert = keyManager.getOrGenerateKey()
+                val ecPublicKey = cert.publicKey as ECPublicKey
+
+                // The raw uncompressed key is always the last 65 bytes of the X.509 encoding
+                val uncompressedPk = ecPublicKey.encoded.sliceArray(ecPublicKey.encoded.size - 65 until ecPublicKey.encoded.size)
+                holderPublicKey = uniffi.agever.holderPkFromUncompressedSec1(uncompressedPk)
+                isHardwareBacked = keyManager.isKeyHardwareBacked()
+            }
+
+            fun clearCredentials() {
+                credentials = emptyList()
+                selectedHandle = null
+                gapList = null
+                revocationStatusFromCache = false
+                validityByHandle = emptyMap<ULong, Boolean>()
+                saveCredentials(context, emptyList())
+                preferences.edit().remove(REVOCATION_STATUS_KEY).apply()
+            }
+
+            fun resetUserKey() {
+                keyManager.deleteKey()
+                try {
+                    refreshHolderKey()
+                } catch (e: Exception) {
+                    errorMessage = "Key error: ${e.message}"
+                }
+            }
+
+            fun clearAllData() {
+                clearCredentials()
+                preferences.edit().clear().apply()
+                reloadStatusOnOpen = false
+                reloadStatusOnRedirect = false
+                reuseRevocationStatus = true
+                resetUserKey()
+            }
+
             LaunchedEffect(Unit) {
                 if (!cameraPermissionState.status.isGranted) {
                     cameraPermissionState.launchPermissionRequest()
                 }
 
                 try {
-                    val cert = keyManager.getOrGenerateKey()
-                    val ecPublicKey = cert.publicKey as ECPublicKey
-
-                    // The raw uncompressed key is always the last 65 bytes of the X.509 encoding
-                    val uncompressedPk = ecPublicKey.encoded.sliceArray(ecPublicKey.encoded.size - 65 until ecPublicKey.encoded.size)// Result: [0x04, X-bytes (32), Y-bytes (32)]
-                    val hpk = uniffi.agever.holderPkFromUncompressedSec1(uncompressedPk)
-
-                    isHardwareBacked = keyManager.isKeyHardwareBacked()
-                    holderPublicKey = hpk
+                    refreshHolderKey()
                 } catch (e: Exception) {
                     errorMessage = "Key error: ${e.message}"
                 }
 
-                requestNewCredential()
+                if (credentials.isEmpty()) {
+                    requestNewCredential()
+                } else {
+                    selectedHandle = credentials.first().revHandle()
+                    if (reloadStatusOnOpen) {
+                        updateRevocationStatus()
+                    }
+                }
             }
 
             WalletTheme {
@@ -276,7 +476,7 @@ class MainActivity : ComponentActivity() {
                                 modifier = Modifier.fillMaxSize(),
                                 topBar = {
                                     CenterAlignedTopAppBar(
-                                        title = { Text("AgeVer Demo") },
+                                        title = { Text("Age Verification Demo") },
                                         colors = TopAppBarDefaults.centerAlignedTopAppBarColors(
                                             containerColor = MaterialTheme.colorScheme.primaryContainer,
                                             titleContentColor = MaterialTheme.colorScheme.onPrimaryContainer,
@@ -299,9 +499,11 @@ class MainActivity : ComponentActivity() {
                                     isUpdatingRevocation = isUpdatingRevocation,
                                     revocationUpdateTime = revocationUpdateTime,
                                     revocationUpdateError = revocationUpdateError,
+                                    revocationStatusFromCache = revocationStatusFromCache,
                                     validityByHandle = validityByHandle,
                                     onUpdateRevocation = { updateRevocationStatus() },
                                     onRequestNewCredential = { requestNewCredential() },
+                                    onOpenSettings = { currentScreen = AppScreen.Settings },
                                     onNavigateToScanner = {
                                         errorMessage = null
                                         currentScreen = AppScreen.Scanner
@@ -320,13 +522,16 @@ class MainActivity : ComponentActivity() {
                         is AppScreen.Presentation -> {
                             PresentationScreen(
                                 sessionId = screen.sessionId,
-                                credential = credentials.find { it.revHandle() == selectedHandle },
+                                credentials = credentials,
+                                selectedHandle = selectedHandle,
+                                onSelectHandle = { selectedHandle = it },
                                 gapList = gapList,
                                 holderPublicKey = holderPublicKey,
                                 keyManager = keyManager,
                                 client = client,
                                 url = url2,
                                 isRefreshingStatus = isUpdatingRevocation,
+                                revocationStatusFromCache = revocationStatusFromCache,
                                 onRefreshStatus = { updateRevocationStatus() },
                                 onFinish = { success, msg ->
                                     if (!success) {
@@ -338,6 +543,42 @@ class MainActivity : ComponentActivity() {
                                         currentScreen = AppScreen.Home
                                     }
                                 }
+                            )
+                        }
+                        is AppScreen.Settings -> {
+                            SettingsScreen(
+                                credentialsExist = credentials.isNotEmpty(),
+                                reloadStatusOnOpen = reloadStatusOnOpen,
+                                reloadStatusOnRedirect = reloadStatusOnRedirect,
+                                reuseRevocationStatus = reuseRevocationStatus,
+                                onReloadStatusOnOpenChanged = {
+                                    reloadStatusOnOpen = it
+                                    preferences.edit().putBoolean(RELOAD_STATUS_ON_OPEN_KEY, it).apply()
+                                },
+                                onReloadStatusOnRedirectChanged = {
+                                    reloadStatusOnRedirect = it
+                                    preferences.edit().putBoolean(RELOAD_STATUS_ON_REDIRECT_KEY, it).apply()
+                                },
+                                onReuseRevocationStatusChanged = {
+                                    reuseRevocationStatus = it
+                                    preferences.edit().putBoolean(REUSE_REVOCATION_STATUS_KEY, it).apply()
+                                    if (it) {
+                                        gapList = loadStoredRevocationStatus(context)
+                                        revocationStatusFromCache = gapList?.isNotEmpty() == true
+                                        validityByHandle = credentials.associate { cred ->
+                                            cred.revHandle() to (uniffi.agever.findBracket(gapList.orEmpty(), cred.revHandle()) != null)
+                                        }
+                                    } else {
+                                        gapList = null
+                                        revocationStatusFromCache = false
+                                        validityByHandle = emptyMap<ULong, Boolean>()
+                                        preferences.edit().remove(REVOCATION_STATUS_KEY).apply()
+                                    }
+                                },
+                                onResetUserKey = { resetUserKey() },
+                                onClearCredentials = { clearCredentials() },
+                                onClearAllData = { clearAllData() },
+                                onBack = { currentScreen = AppScreen.Home }
                             )
                         }
                     }
@@ -361,21 +602,25 @@ fun DemoScreen(
     isUpdatingRevocation: Boolean,
     revocationUpdateTime: Long?,
     revocationUpdateError: String?,
+    revocationStatusFromCache: Boolean,
     validityByHandle: Map<ULong, Boolean>,
     onUpdateRevocation: () -> Unit,
     onRequestNewCredential: () -> Unit,
+    onOpenSettings: () -> Unit,
     onNavigateToScanner: () -> Unit
 ) {
     val selectedCredential = credentials.find { it.revHandle() == selectedHandle }
     val selectedValid = selectedHandle?.let { validityByHandle[it] }
+    val scrollState = rememberScrollState()
 
-    Column(
-        modifier = modifier
-            .padding(24.dp)
-            .verticalScroll(rememberScrollState()),
-        horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.Top
-    ) {
+    Box(modifier = modifier) {
+        Column(
+            modifier = Modifier
+                .padding(24.dp)
+                .verticalScroll(scrollState),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.Top
+        ) {
         ElevatedCard(
             modifier = Modifier.fillMaxWidth(),
             elevation = CardDefaults.elevatedCardElevation(defaultElevation = 6.dp)
@@ -384,7 +629,10 @@ fun DemoScreen(
                 modifier = Modifier.padding(16.dp),
                 horizontalAlignment = Alignment.Start
             ) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
                     Icon(
                         imageVector = Icons.Default.Key,
                         contentDescription = null,
@@ -396,6 +644,13 @@ fun DemoScreen(
                         style = MaterialTheme.typography.titleMedium,
                         color = MaterialTheme.colorScheme.primary
                     )
+                    Spacer(modifier = Modifier.weight(1f))
+                    IconButton(onClick = onOpenSettings) {
+                        Icon(
+                            imageVector = Icons.Default.Settings,
+                            contentDescription = "Settings"
+                        )
+                    }
                 }
                 Spacer(modifier = Modifier.height(16.dp))
 
@@ -421,7 +676,8 @@ fun DemoScreen(
                         selectedCredential == null -> null
                         revocationUpdateError != null -> revocationUpdateError
                         selectedValid == false -> "This credential is no longer valid"
-                        selectedValid == true -> "Updated in ${revocationUpdateTime}ms"
+                        selectedValid == true && revocationStatusFromCache -> "Status loaded from cache"
+                        selectedValid == true -> "Updated in ${revocationUpdateTime ?: 0}ms"
                         gapList != null -> "Refresh to check this credential"
                         else -> "Not fetched yet"
                     },
@@ -525,6 +781,224 @@ fun DemoScreen(
                 }
             }
         }
+        }
+        ScrollIndicator(
+            scrollState = scrollState,
+            modifier = Modifier
+                .align(Alignment.CenterEnd)
+                .padding(end = 4.dp)
+        )
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun SettingsScreen(
+    credentialsExist: Boolean,
+    reloadStatusOnOpen: Boolean,
+    reloadStatusOnRedirect: Boolean,
+    reuseRevocationStatus: Boolean,
+    onReloadStatusOnOpenChanged: (Boolean) -> Unit,
+    onReloadStatusOnRedirectChanged: (Boolean) -> Unit,
+    onReuseRevocationStatusChanged: (Boolean) -> Unit,
+    onResetUserKey: () -> Unit,
+    onClearCredentials: () -> Unit,
+    onClearAllData: () -> Unit,
+    onBack: () -> Unit
+) {
+    var showClearConfirmation by remember { mutableStateOf(false) }
+    var showResetKeyConfirmation by remember { mutableStateOf(false) }
+    var showClearAllConfirmation by remember { mutableStateOf(false) }
+    val scrollState = rememberScrollState()
+
+    BackHandler(onBack = onBack)
+
+    Scaffold(
+        topBar = {
+            CenterAlignedTopAppBar(
+                title = { Text("Settings") },
+                navigationIcon = {
+                    IconButton(onClick = onBack) {
+                        Icon(Icons.Default.ArrowBack, contentDescription = "Back")
+                    }
+                }
+            )
+        }
+    ) { innerPadding ->
+        Box(
+            modifier = Modifier
+                .padding(innerPadding)
+                .fillMaxSize()
+        ) {
+            Column(
+                modifier = Modifier
+                    .verticalScroll(scrollState)
+                    .padding(24.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+            SettingSwitchRow(
+                title = "Auto-Reload status on open",
+                checked = reloadStatusOnOpen,
+                onCheckedChange = onReloadStatusOnOpenChanged
+            )
+            SettingSwitchRow(
+                title = "Auto-Reload status on browser redirect",
+                checked = reloadStatusOnRedirect,
+                onCheckedChange = onReloadStatusOnRedirectChanged
+            )
+            SettingSwitchRow(
+                title = "Reuse saved revocation status",
+                checked = reuseRevocationStatus,
+                onCheckedChange = onReuseRevocationStatusChanged
+            )
+
+            Spacer(modifier = Modifier.height(16.dp))
+
+            Button(
+                modifier = Modifier.fillMaxWidth(),
+                enabled = credentialsExist,
+                onClick = { showClearConfirmation = true },
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = MaterialTheme.colorScheme.error,
+                    contentColor = MaterialTheme.colorScheme.onError
+                )
+            ) {
+                Icon(Icons.Default.Delete, contentDescription = null)
+                Spacer(modifier = Modifier.size(8.dp))
+                Text("Clear All Credentials")
+            }
+
+            Button(
+                modifier = Modifier.fillMaxWidth(),
+                onClick = { showResetKeyConfirmation = true },
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = MaterialTheme.colorScheme.error,
+                    contentColor = MaterialTheme.colorScheme.onError
+                )
+            ) {
+                Icon(Icons.Default.Key, contentDescription = null)
+                Spacer(modifier = Modifier.size(8.dp))
+                Text("Reset User Device Key")
+            }
+
+            Spacer(modifier = Modifier.height(24.dp))
+
+            Button(
+                modifier = Modifier.fillMaxWidth(),
+                onClick = { showClearAllConfirmation = true },
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = MaterialTheme.colorScheme.error,
+                    contentColor = MaterialTheme.colorScheme.onError
+                )
+            ) {
+                Icon(Icons.Default.Delete, contentDescription = null)
+                Spacer(modifier = Modifier.size(8.dp))
+                Text("Erase All Data")
+            }
+            }
+            ScrollIndicator(
+                scrollState = scrollState,
+                modifier = Modifier
+                    .align(Alignment.CenterEnd)
+                    .padding(end = 4.dp)
+            )
+        }
+    }
+
+    if (showClearConfirmation) {
+        AlertDialog(
+            onDismissRequest = { showClearConfirmation = false },
+            title = { Text("Clear all credentials?") },
+            text = { Text("This will permanently remove all stored credentials from this device.") },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        showClearConfirmation = false
+                        onClearCredentials()
+                    },
+                    colors = ButtonDefaults.textButtonColors(
+                        contentColor = MaterialTheme.colorScheme.error
+                    )
+                ) {
+                    Text("Clear All")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showClearConfirmation = false }) {
+                    Text("Cancel")
+                }
+            }
+        )
+    }
+
+    if (showResetKeyConfirmation) {
+        AlertDialog(
+            onDismissRequest = { showResetKeyConfirmation = false },
+            title = { Text("Reset user device key?") },
+            text = { Text("This invalidates credentials bound to the current key. Clear all old credentials after resetting the key, then request new credentials.") },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        showResetKeyConfirmation = false
+                        onResetUserKey()
+                    },
+                    colors = ButtonDefaults.textButtonColors(
+                        contentColor = MaterialTheme.colorScheme.error
+                    )
+                ) {
+                    Text("Reset Key")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showResetKeyConfirmation = false }) {
+                    Text("Cancel")
+                }
+            }
+        )
+    }
+
+    if (showClearAllConfirmation) {
+        AlertDialog(
+            onDismissRequest = { showClearAllConfirmation = false },
+            title = { Text("Erase all app data?") },
+            text = { Text("This resets credentials, settings, and the user device key to the initial app state.") },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        showClearAllConfirmation = false
+                        onClearAllData()
+                    },
+                    colors = ButtonDefaults.textButtonColors(
+                        contentColor = MaterialTheme.colorScheme.error
+                    )
+                ) {
+                    Text("Erase All Data")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showClearAllConfirmation = false }) {
+                    Text("Cancel")
+                }
+            }
+        )
+    }
+}
+
+@Composable
+fun SettingSwitchRow(
+    title: String,
+    checked: Boolean,
+    onCheckedChange: (Boolean) -> Unit
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable { onCheckedChange(!checked) }
+            .padding(vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Text(text = title, modifier = Modifier.weight(1f))
+        Switch(checked = checked, onCheckedChange = onCheckedChange)
     }
 }
 
@@ -612,13 +1086,16 @@ fun ScannerScreen(
 @Composable
 fun PresentationScreen(
     sessionId: String,
-    credential: AgeVerCredential?,
+    credentials: List<AgeVerCredential>,
+    selectedHandle: ULong?,
+    onSelectHandle: (ULong) -> Unit,
     gapList: List<AgeVerGapCredential>?,
     holderPublicKey: AgeVerHolderPublicKey?,
     keyManager: HardwareKeyManager,
     client: OkHttpClient,
     url: String,
     isRefreshingStatus: Boolean,
+    revocationStatusFromCache: Boolean,
     onRefreshStatus: () -> Unit,
     onFinish: (Boolean, String?) -> Unit
 ) {
@@ -630,8 +1107,14 @@ fun PresentationScreen(
     var signingTime by remember { mutableStateOf<Long?>(null) }
     var presentationTime by remember { mutableStateOf<Long?>(null) }
     var verificationTime by remember { mutableStateOf<Long?>(null) }
+    var revealedFields by remember { mutableStateOf<Set<String>>(emptySet()) }
+    val scrollState = rememberScrollState()
 
     val scope = rememberCoroutineScope()
+    val credential = credentials.find { it.revHandle() == selectedHandle }
+    val revocationBracket = credential?.let { selectedCredential ->
+        gapList?.let { gaps -> uniffi.agever.findBracket(gaps, selectedCredential.revHandle()) }
+    }
     val selectedValid = credential?.revHandle()?.let { revHandle ->
         gapList?.let { gaps -> uniffi.agever.findBracket(gaps, revHandle) != null }
     }
@@ -717,15 +1200,42 @@ fun PresentationScreen(
             )
         }
     ) { innerPadding ->
-        Column(
+        Box(
             modifier = Modifier
                 .padding(innerPadding)
                 .fillMaxSize()
-                .padding(24.dp),
-            horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.Center
         ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(24.dp)
+                    .verticalScroll(scrollState),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.Top
+            ) {
             if (!isConfirmed) {
+                if (credentials.isNotEmpty()) {
+                    Text(
+                        text = "Credential",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.outline
+                    )
+                    Spacer(modifier = Modifier.height(8.dp))
+                    LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        items(credentials, key = { it.revHandle().toString() }) { cred ->
+                            CredentialChip(
+                                credential = cred,
+                                isSelected = cred.revHandle() == selectedHandle,
+                                isValid = gapList?.let { gaps ->
+                                    uniffi.agever.findBracket(gaps, cred.revHandle()) != null
+                                },
+                                onClick = { onSelectHandle(cred.revHandle()) }
+                            )
+                        }
+                    }
+                    Spacer(modifier = Modifier.height(24.dp))
+                }
+
                 Text(
                     text = "Present Credential?",
                     style = MaterialTheme.typography.headlineSmall,
@@ -739,22 +1249,42 @@ fun PresentationScreen(
                 )
                 Spacer(modifier = Modifier.height(24.dp))
 
-                val displayClaims = remember(credential) {
+                val displayClaims = remember(credential, revocationBracket) {
                     try {
                         val original = JSONObject(credential?.claimsJsonStr() ?: "{}")
                         val modified = JSONObject()
                         val now = SimpleDateFormat("MMM dd, yyyy hh:mm", Locale.getDefault()).format(Date())
 
-                        modified.put("name", JSONObject().put("type", "string").put("val", "<hidden>"))
+                        modified.put("name", JSONObject()
+                            .put("type", "string")
+                            .put("display", "<hidden>")
+                            .put("actual", original.optJSONObject("name")?.optString("val", "N/A") ?: "N/A"))
                         
                         // Show above16 as true (revealed)
                         if (original.has("above16")) {
                             modified.put("above16", original.getJSONObject("above16"))
                         }
                         
-                        modified.put("above18", JSONObject().put("type", "string").put("val", "<hidden>"))
-                        modified.put("nbf", JSONObject().put("type", "string").put("val", "earlier than $now"))
-                        modified.put("exp", JSONObject().put("type", "string").put("val", "later than $now"))
+                        modified.put("above18", JSONObject()
+                            .put("type", "string")
+                            .put("display", "<hidden>")
+                            .put("actual", original.optJSONObject("above18")?.optString("val", "N/A") ?: "N/A"))
+                        modified.put("nbf", JSONObject()
+                            .put("type", "string")
+                            .put("display", "earlier than $now")
+                            .put("actual", original.optJSONObject("nbf")?.optString("val", "N/A") ?: "N/A"))
+                        modified.put("exp", JSONObject()
+                            .put("type", "string")
+                            .put("display", "later than $now")
+                            .put("actual", original.optJSONObject("exp")?.optString("val", "N/A") ?: "N/A"))
+                        revocationBracket?.let { bracket ->
+                            val bracketClaims = JSONObject(bracket.claimsJsonStr())
+                            val epoch = bracketClaims.optJSONObject("epoch")?.optString("val", "N/A") ?: "N/A"
+                            modified.put("revocation", JSONObject()
+                                .put("type", "string")
+                                .put("display", "is not revoked at epoch $epoch")
+                                .put("actual", bracketClaims.toString(2)))
+                        }
                         modified
                     } catch (e: Exception) {
                         JSONObject()
@@ -766,7 +1296,13 @@ fun PresentationScreen(
                     elevation = CardDefaults.elevatedCardElevation(defaultElevation = 4.dp)
                 ) {
                     Column(modifier = Modifier.padding(16.dp)) {
-                        ClaimsList(displayClaims)
+                        RevealableClaimsList(displayClaims, revealedFields) { field ->
+                            revealedFields = if (revealedFields.contains(field)) {
+                                revealedFields - field
+                            } else {
+                                revealedFields + field
+                            }
+                        }
                     }
                 }
 
@@ -779,6 +1315,7 @@ fun PresentationScreen(
                     subtitle = when {
                         credential == null -> null
                         selectedValid == false -> "This credential is no longer valid"
+                        selectedValid == true && revocationStatusFromCache -> "Status refreshed from cache"
                         selectedValid == true -> "Status refreshed"
                         gapList != null -> "Refresh to check this credential"
                         else -> "Not fetched yet"
@@ -815,9 +1352,16 @@ fun PresentationScreen(
                     Text("Cancel")
                 }
             } else if (isProcessing) {
-                CircularProgressIndicator(modifier = Modifier.size(64.dp))
-                Spacer(modifier = Modifier.height(24.dp))
-                Text(statusText, style = MaterialTheme.typography.titleMedium)
+                Box(
+                    modifier = Modifier.fillMaxSize(),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                        CircularProgressIndicator(modifier = Modifier.size(64.dp))
+                        Spacer(modifier = Modifier.height(24.dp))
+                        Text(statusText, style = MaterialTheme.typography.titleMedium)
+                    }
+                }
             } else {
                 Icon(
                     imageVector = if (success) Icons.Default.CheckCircle else Icons.Default.Error,
@@ -867,6 +1411,13 @@ fun PresentationScreen(
                     Text("OK")
                 }
             }
+            }
+            ScrollIndicator(
+                scrollState = scrollState,
+                modifier = Modifier
+                    .align(Alignment.CenterEnd)
+                    .padding(end = 4.dp)
+            )
         }
     }
 }
@@ -885,6 +1436,77 @@ fun ClaimsList(claimsJson: JSONObject) {
             ClaimRow(label = label, valueObj = valueObj)
         }
     }
+}
+
+@Composable
+fun RevealableClaimsList(
+    claimsJson: JSONObject,
+    revealedFields: Set<String>,
+    onToggleReveal: (String) -> Unit
+) {
+    val displayKeys = listOf(
+        "name" to "Name",
+        "above16" to "Above 16",
+        "above18" to "Above 18",
+        "nbf" to "Valid From",
+        "exp" to "Expires At",
+        "revocation" to "Revocation"
+    )
+    displayKeys.forEach { (key, label) ->
+        claimsJson.optJSONObject(key)?.let { valueObj ->
+            val isRevealed = revealedFields.contains(key)
+            val displayValue = if (isRevealed) {
+                valueObj.optString("actual", valueObj.optString("val", "N/A"))
+            } else {
+                valueObj.optString("display", valueObj.optString("val", "<hidden>"))
+            }
+            
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clickable { onToggleReveal(key) }
+                    .padding(vertical = 8.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = label,
+                    style = MaterialTheme.typography.bodyMedium,
+                    modifier = Modifier.weight(1f)
+                )
+                Text(
+                    text = displayValue,
+                    style = if (isRevealed) {
+                        MaterialTheme.typography.bodySmall.copy(
+                            fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace,
+                            fontWeight = FontWeight.Bold
+                        )
+                    } else {
+                        MaterialTheme.typography.bodySmall
+                    },
+                    color = if (isRevealed) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier
+                        .padding(start = 12.dp)
+                        .weight(1.5f)
+                )
+            }
+            Divider(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(vertical = 4.dp),
+                color = MaterialTheme.colorScheme.outlineVariant
+            )
+        }
+    }
+}
+
+@Composable
+fun Divider(modifier: Modifier = Modifier, color: Color = Color.Gray) {
+    Box(
+        modifier = modifier
+            .height(1.dp)
+            .background(color)
+    )
 }
 
 @Composable
@@ -987,6 +1609,9 @@ fun ClaimRow(label: String, valueObj: JSONObject) {
 fun ScannerView(onScanned: (String) -> Unit) {
     val context = androidx.compose.ui.platform.LocalContext.current
     val lifecycleOwner = androidx.lifecycle.compose.LocalLifecycleOwner.current
+    var lastScannedValue by remember { mutableStateOf<String?>(null) }
+    var lastScanTime by remember { mutableStateOf(0L) }
+    val SCAN_DEBOUNCE_MS = 500L
 
     val cameraController = remember {
         LifecycleCameraController(context).apply {
@@ -1005,7 +1630,12 @@ fun ScannerView(onScanned: (String) -> Unit) {
                     val barcodes = result.getValue(barcodeScanner)
                     if (!barcodes.isNullOrEmpty()) {
                         barcodes.firstOrNull()?.rawValue?.let {
-                            onScanned(it)
+                            val currentTime = System.currentTimeMillis()
+                            if (it != lastScannedValue && (currentTime - lastScanTime) > SCAN_DEBOUNCE_MS) {
+                                lastScannedValue = it
+                                lastScanTime = currentTime
+                                onScanned(it)
+                            }
                         }
                     }
                 }
@@ -1050,9 +1680,11 @@ fun DemoScreenPreview() {
             isUpdatingRevocation = false,
             revocationUpdateTime = null,
             revocationUpdateError = null,
+            revocationStatusFromCache = false,
             validityByHandle = emptyMap(),
             onUpdateRevocation = {},
             onRequestNewCredential = {},
+            onOpenSettings = {},
             onNavigateToScanner = {}
         )
     }

@@ -21,14 +21,12 @@ class HardwareKeyManager(private val context: Context) {
     private val keyStore = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
 
     fun getOrGenerateKey(): Certificate {
-        deleteKey() // TODO for testing
+        // deleteKey() // TODO for testing
         if (!keyStore.containsAlias(keyAlias)) {
             generateKey()
         }
-        val hasAPILevel = Build.VERSION.SDK_INT >= Build.VERSION_CODES.P
         val hasstrongbox = context.packageManager.hasSystemFeature(PackageManager.FEATURE_STRONGBOX_KEYSTORE)
-        Log.d("KeyManager", "has strongbox: $hasstrongbox, has apilevel: $hasAPILevel")
-        1
+        Log.d("KeyManager", "has strongbox: $hasstrongbox")
         val entry = keyStore.getEntry(keyAlias, null) as KeyStore.PrivateKeyEntry
         return entry.certificate
     }
@@ -38,7 +36,7 @@ class HardwareKeyManager(private val context: Context) {
     }
 
 
-    private fun deleteKey() {
+        fun deleteKey() {
       if (keyStore.containsAlias(keyAlias)) {
           keyStore.deleteEntry(keyAlias)
           Log.d("KeyManager", "deleted key")
@@ -89,7 +87,11 @@ class HardwareKeyManager(private val context: Context) {
         } catch (e: Exception) {
             return false
         }
-        return keyInfo.securityLevel == KeyProperties.SECURITY_LEVEL_STRONGBOX
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            keyInfo.securityLevel == KeyProperties.SECURITY_LEVEL_STRONGBOX
+        } else {
+            keyInfo.isInsideSecureHardware
+        }
     }
 
 
