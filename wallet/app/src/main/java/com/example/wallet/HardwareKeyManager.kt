@@ -21,7 +21,7 @@ class HardwareKeyManager(private val context: Context) {
     private val keyStore = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
 
     fun getOrGenerateKey(): Certificate {
-        deleteKey() // TODO for testing
+        // deleteKey() // TODO for testing
         if (!keyStore.containsAlias(keyAlias)) {
             generateKey()
         }
@@ -38,7 +38,7 @@ class HardwareKeyManager(private val context: Context) {
     }
 
 
-    private fun deleteKey() {
+        fun deleteKey() {
       if (keyStore.containsAlias(keyAlias)) {
           keyStore.deleteEntry(keyAlias)
           Log.d("KeyManager", "deleted key")

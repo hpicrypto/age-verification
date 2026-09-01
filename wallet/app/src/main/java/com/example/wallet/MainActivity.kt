@@ -274,21 +274,23 @@ class MainActivity : ComponentActivity() {
                 }
             }
 
+            fun refreshHolderKey() {
+                val cert = keyManager.getOrGenerateKey()
+                val ecPublicKey = cert.publicKey as ECPublicKey
+
+                // The raw uncompressed key is always the last 65 bytes of the X.509 encoding
+                val uncompressedPk = ecPublicKey.encoded.sliceArray(ecPublicKey.encoded.size - 65 until ecPublicKey.encoded.size)
+                holderPublicKey = uniffi.agever.holderPkFromUncompressedSec1(uncompressedPk)
+                isHardwareBacked = keyManager.isKeyHardwareBacked()
+            }
+
             LaunchedEffect(Unit) {
                 if (!cameraPermissionState.status.isGranted) {
                     cameraPermissionState.launchPermissionRequest()
                 }
 
                 try {
-                    val cert = keyManager.getOrGenerateKey()
-                    val ecPublicKey = cert.publicKey as ECPublicKey
-
-                    // The raw uncompressed key is always the last 65 bytes of the X.509 encoding
-                    val uncompressedPk = ecPublicKey.encoded.sliceArray(ecPublicKey.encoded.size - 65 until ecPublicKey.encoded.size)// Result: [0x04, X-bytes (32), Y-bytes (32)]
-                    val hpk = uniffi.agever.holderPkFromUncompressedSec1(uncompressedPk)
-
-                    isHardwareBacked = keyManager.isKeyHardwareBacked()
-                    holderPublicKey = hpk
+                    refreshHolderKey()
                 } catch (e: Exception) {
                     errorMessage = "Key error: ${e.message}"
                 }
@@ -351,8 +353,16 @@ class MainActivity : ComponentActivity() {
                                     onClearCredentials = {
                                         credentials = emptyList()
                                         selectedHandle = null
+                                        gapList = null
                                         validityByHandle = emptyMap()
                                         saveCredentials(context, emptyList())
+                                        keyManager.deleteKey()
+                                        try {
+                                            // Regenerate the key here; otherwise getCertificateChain() is empty on the next credential request.
+                                            refreshHolderKey()
+                                        } catch (e: Exception) {
+                                            errorMessage = "Key error: ${e.message}"
+                                        }
                                     },
                                     onNavigateToScanner = {
                                         errorMessage = null
